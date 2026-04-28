@@ -1,0 +1,711 @@
+#!/usr/bin/env python3
+# =============================================================================
+#  rh-analyze — Analizador de reportes RootHunter v1.0
+#  Lee reportes JSON generados por roothunter.sh
+#  análisis: sugerencias de exploits, attack paths, scoring, diff.
+#
+#  Uso:
+#    rh-analyze reporte.json                    # Análisis estándar
+#    rh-analyze reporte.json --score            # Solo score numérico
+#    rh-analyze reporte.json --paths            # Solo attack paths
+#    rh-analyze reporte.json --exploits         # Solo exploits sugeridos
+#    rh-analyze --diff old.json new.json        # Comparar dos auditorías
+#    rh-analyze --batch *.json                  # Priorizar múltiples hosts
+#    rh-analyze reporte.json -o analisis.md     # Exportar Markdown
+#
+#  Requiere: Python 3.7+ (solo stdlib)
+#  Solo análisis defensivo. No ejecuta exploits, no automatiza ataque.
+# =============================================================================
+
+import argparse
+import json
+import re
+import sys
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Optional
+
+# ─── ANSI colors ──────────────────────────────────────────────────────────────
+class C:
+    RED = '\033[0;31m'
+    YELLOW = '\033[1;33m'
+    GREEN = '\033[0;32m'
+    CYAN = '\033[0;36m'
+    BOLD = '\033[1m'
+    DIM = '\033[2m'
+    RESET = '\033[0m'
+
+    @staticmethod
+    def disable():
+        for attr in dir(C):
+            if not attr.startswith('_') and attr.isupper():
+                setattr(C, attr, '')
+
+
+# ─── Modelo de datos ──────────────────────────────────────────────────────────
+@dataclass
+class Finding:
+    """Un hallazgo individual extraído del reporte."""
+    severity: str
+    module: str
+    text: str
+
+    def matches(self, *patterns: str) -> bool:
+        """Devuelve True si el texto del hallazgo coincide con cualquier patrón."""
+        return any(re.search(p, self.text, re.IGNORECASE) for p in patterns)
+
+
+@dataclass
+class Report:
+    """Reporte completo parseado."""
+    hostname: str
+    kernel: str
+    os: str
+    user: str
+    timestamp: str
+    findings: list[Finding] = field(default_factory=list)
+    raw: dict = field(default_factory=dict)
+
+    @classmethod
+    def from_file(cls, path: Path) -> 'Report':
+        with path.open(encoding='utf-8') as f:
+            data = json.load(f)
+        report = data.get('report', data)
+        target = report.get('target', {})
+        findings = []
+        for module in report.get('modules', []):
+            mname = module.get('module', '?')
+            for sev in ('critical', 'warnings', 'info'):
+                for text in module.get(sev, []):
+                    findings.append(Finding(
+                        severity=sev.rstrip('s'),  # 'warnings' -> 'warning'
+                        module=mname,
+                        text=text,
+                    ))
+        return cls(
+            hostname=target.get('hostname', '?'),
+            kernel=target.get('kernel', '?'),
+            os=target.get('os', '?'),
+            user=target.get('user', '?'),
+            timestamp=report.get('timestamp', '?'),
+            findings=findings,
+            raw=report,
+        )
+
+    def critical(self) -> list[Finding]:
+        return [f for f in self.findings if f.severity == 'critical']
+
+    def warnings(self) -> list[Finding]:
+        return [f for f in self.findings if f.severity == 'warning']
+
+    def find(self, *patterns: str) -> list[Finding]:
+        """Devuelve todos los findings que coincidan con cualquier patrón."""
+        return [f for f in self.findings if f.matches(*patterns)]
+
+    def has(self, *patterns: str) -> bool:
+        return bool(self.find(*patterns))
+
+
+# ─── Comparador de versiones ──────────────────────────────────────────────────
+def parse_version(v: str) -> tuple:
+    """Convierte '1.8.31p2' en (1, 8, 31) — ignora sufijos no numéricos."""
+    m = re.match(r'(\d+(?:\.\d+)*)', v)
+    if not m:
+        return (0,)
+    return tuple(int(x) for x in m.group(1).split('.'))
+
+
+def vlt(a: str, b: str) -> bool:
+    """¿a < b? con padding de zeros."""
+    pa, pb = parse_version(a), parse_version(b)
+    n = max(len(pa), len(pb))
+    pa = pa + (0,) * (n - len(pa))
+    pb = pb + (0,) * (n - len(pb))
+    return pa < pb
+
+
+def vge(a: str, b: str) -> bool:
+    return not vlt(a, b)
+
+
+# ─── Base de exploits ─────────────────────────────────────────────────────────
+@dataclass
+class Exploit:
+    cve: str
+    name: str
+    severity: str           # 'critical' | 'high' | 'medium'
+    description: str
+    poc_url: str
+    # Función predicado: recibe Report y devuelve True si aplica
+    applies: callable = None
+    requires: str = ''      # Texto explicativo de pre-requisitos
+
+EXPLOITS: list[Exploit] = []
+
+
+def exploit(cve, name, severity, description, poc_url, requires=''):
+    """Decorador para registrar un exploit en la base."""
+    def decorator(fn):
+        EXPLOITS.append(Exploit(
+            cve=cve, name=name, severity=severity,
+            description=description, poc_url=poc_url,
+            applies=fn, requires=requires,
+        ))
+        return fn
+    return decorator
+
+
+@exploit(
+    cve='CVE-2021-3156',
+    name='Baron Samedit (sudo heap overflow)',
+    severity='critical',
+    description='Heap buffer overflow en sudoedit — escalada local a root',
+    poc_url='https://github.com/blasty/CVE-2021-3156',
+)
+def _check_baron_samedit(r: Report) -> bool:
+    # Buscar versión de sudo en los hallazgos
+    for f in r.find(r'sudo[:\s]+(\d+\.\d+\.\d+)'):
+        m = re.search(r'(\d+\.\d+\.\d+(?:p\d+)?)', f.text)
+        if m and vlt(m.group(1), '1.9.5'):
+            return True
+    return False
+
+
+@exploit(
+    cve='CVE-2021-4034',
+    name='PwnKit (pkexec)',
+    severity='critical',
+    description='Manipulación de argv permite escalada a root sin autenticación',
+    poc_url='https://github.com/ly4k/PwnKit',
+)
+def _check_pwnkit(r: Report) -> bool:
+    return r.has(r'pkexec.*<\s*0\.120', r'PwnKit', r'CVE-2021-4034')
+
+
+@exploit(
+    cve='CVE-2022-0847',
+    name='Dirty Pipe',
+    severity='critical',
+    description='Escritura arbitraria en archivos de solo lectura — escalada a root',
+    poc_url='https://github.com/AlexisAhmed/CVE-2022-0847-DirtyPipe-Exploits',
+)
+def _check_dirty_pipe(r: Report) -> bool:
+    m = re.match(r'(\d+\.\d+(?:\.\d+)?)', r.kernel)
+    if not m:
+        return False
+    k = m.group(1)
+    return vge(k, '5.8') and vlt(k, '5.16.11')
+
+
+@exploit(
+    cve='CVE-2023-4911',
+    name='Looney Tunables (glibc)',
+    severity='critical',
+    description='Buffer overflow en GLIBC_TUNABLES — escalada local',
+    poc_url='https://www.qualys.com/2023/10/03/cve-2023-4911/looney-tunables-local-privilege-escalation-glibc-ld-so.txt',
+    requires='glibc 2.34 - 2.38',
+)
+def _check_looney_tunables(r: Report) -> bool:
+    for f in r.find(r'glibc[:\s]+(\d+\.\d+)'):
+        m = re.search(r'(\d+\.\d+)', f.text)
+        if m and vge(m.group(1), '2.34') and vlt(m.group(1), '2.39'):
+            return True
+    return False
+
+
+@exploit(
+    cve='GTFOBins',
+    name='Grupo docker = root en host',
+    severity='critical',
+    description='Membresía en grupo docker permite montar / del host y obtener root',
+    poc_url='https://gtfobins.github.io/gtfobins/docker/',
+)
+def _check_docker_group(r: Report) -> bool:
+    return r.has(r'grupo.*docker', r'docker.*grupo', r'group.*docker')
+
+
+@exploit(
+    cve='Container escape',
+    name='Docker socket escribible',
+    severity='critical',
+    description='Acceso de escritura al socket Docker permite spawn de containers privilegiados',
+    poc_url='https://book.hacktricks.xyz/linux-hardening/privilege-escalation/docker-security/docker-breakout-privilege-escalation',
+)
+def _check_docker_sock(r: Report) -> bool:
+    return r.has(r'docker.sock.*escribible', r'docker.sock.*writable')
+
+
+# ─── Attack paths ─────────────────────────────────────────────────────────────
+@dataclass
+class AttackPath:
+    name: str
+    severity: str
+    steps: list[str]
+    impact: str             # Descripción del resultado final (ej: 'shell como root')
+
+
+def find_attack_paths(r: Report) -> list[AttackPath]:
+    """Encadena hallazgos para construir rutas de escalada."""
+    paths = []
+
+    # Patrón: cron escribible → ejecución como root
+    cron_writable = r.find(r'cron.*escrib', r'cron.*writable', r'Script cron ESCRIBIBLE')
+    if cron_writable:
+        paths.append(AttackPath(
+            name='Escalada vía cron escribible',
+            severity='critical',
+            steps=[
+                f"Identificado: {cron_writable[0].text}",
+                "Modificar el script con un payload (reverse shell o copia de bash con SUID)",
+                "Esperar próxima ejecución del cron (típicamente ≤ 1 hora)",
+                "Obtener ejecución como root",
+            ],
+            impact='Shell como root tras la próxima ejecución del cron',
+        ))
+
+    # Patrón: SUID peligroso explotable
+    suid_dangerous = r.find(r'SUID peligroso')
+    for finding in suid_dangerous[:3]:
+        m = re.search(r'/[\w/]+/(\w+)', finding.text)
+        if m:
+            binary = m.group(1)
+            paths.append(AttackPath(
+                name=f'Escalada vía SUID en {binary}',
+                severity='critical',
+                steps=[
+                    f"Binario SUID detectado: {finding.text}",
+                    f"Consultar técnica específica en GTFOBins",
+                    f"Ejecutar payload de escalada documentado",
+                ],
+                impact=f'Ejecución directa como root vía {binary}',
+            ))
+
+    # Patrón: NOPASSWD sudo
+    if r.has(r'NOPASSWD', r'sudo SIN contrase'):
+        paths.append(AttackPath(
+            name='Escalada vía sudo NOPASSWD',
+            severity='critical',
+            steps=[
+                "Sudo configurado para ejecutar comandos sin contraseña",
+                "Revisar sudo -l para identificar comandos permitidos",
+                "Si el comando está en GTFOBins, usar la técnica documentada",
+                "Caso típico: sudo /usr/bin/find . -exec /bin/sh \\; -quit",
+            ],
+            impact='Shell como root inmediato',
+        ))
+
+    # Patrón: PATH escribible + cron como root
+    path_writable = r.find(r'ESCRIBIBLE en PATH', r'PATH hijacking')
+    if path_writable and (cron_writable or r.has(r'cron')):
+        paths.append(AttackPath(
+            name='Escalada vía PATH hijacking + cron',
+            severity='critical',
+            steps=[
+                f"Directorio escribible en PATH: {path_writable[0].text}",
+                "Identificar comandos sin ruta absoluta en scripts cron de root",
+                "Crear un binario malicioso con ese nombre en el directorio escribible",
+                "Esperar ejecución del cron",
+            ],
+            impact='Ejecución como root cuando cron invoque el comando',
+        ))
+
+    # Patrón: kernel vulnerable + sin user namespaces restringidos
+    if r.has(r'CVE-2022-0847', r'Dirty Pipe', r'CVE-2023-4911', r'Looney'):
+        paths.append(AttackPath(
+            name='Escalada vía exploit de kernel/glibc',
+            severity='critical',
+            steps=[
+                "Versión vulnerable detectada (ver sección de exploits)",
+                "Compilar y ejecutar el PoC público en el host",
+                "Obtener shell como root",
+            ],
+            impact='Ejecución arbitraria con privilegios de kernel',
+        ))
+
+    # Patrón: clave SSH privada legible
+    ssh_keys = r.find(r'Clave SSH privada legible')
+    if ssh_keys:
+        paths.append(AttackPath(
+            name='Movimiento lateral vía clave SSH expuesta',
+            severity='high',
+            steps=[
+                f"Clave privada legible: {ssh_keys[0].text}",
+                "Determinar qué usuarios/hosts confían en esta clave",
+                "Usar la clave para autenticarse en otros sistemas",
+            ],
+            impact='Acceso a sistemas que confíen en esta clave',
+        ))
+
+    # Patrón: token K8s accesible
+    if r.has(r'Kubernetes ServiceAccount'):
+        paths.append(AttackPath(
+            name='Movimiento lateral en cluster Kubernetes',
+            severity='high',
+            steps=[
+                "Token de ServiceAccount accesible",
+                "Usar kubectl con el token para enumerar permisos",
+                "Pivote a otros pods/secrets según permisos del SA",
+            ],
+            impact='Posible takeover del cluster según privilegios del SA',
+        ))
+
+    # Patrón: credenciales cloud accesibles vía IMDS
+    if r.has(r'Credenciales AWS IAM accesibles', r'Token Managed Identity', r'Token de servicio GCP'):
+        paths.append(AttackPath(
+            name='Movimiento lateral en cuenta cloud',
+            severity='high',
+            steps=[
+                "Credenciales temporales obtenibles vía IMDS",
+                "Configurar AWS/GCP/Azure CLI con las credenciales",
+                "Enumerar permisos del rol y pivotar a recursos accesibles",
+            ],
+            impact='Acceso a recursos cloud según permisos del rol',
+        ))
+
+    return paths
+
+
+# ─── Scoring ──────────────────────────────────────────────────────────────────
+def calculate_score(r: Report) -> tuple[int, dict]:
+    """Devuelve (score 0-100, breakdown)."""
+    breakdown = {}
+
+    # Críticos pesan mucho
+    n_crit = len(r.critical())
+    breakdown['críticos'] = min(n_crit * 10, 60)
+
+    # Advertencias pesan menos
+    n_warn = len(r.warnings())
+    breakdown['advertencias'] = min(n_warn * 2, 20)
+
+    # Bonus contextual: ciertos hallazgos elevan el riesgo desproporcionadamente
+    bonus = 0
+    bonus_reasons = []
+
+    if r.has(r'docker.sock.*escribible', r'grupo docker'):
+        bonus += 10
+        bonus_reasons.append('acceso a Docker')
+    if r.has(r'NOPASSWD'):
+        bonus += 8
+        bonus_reasons.append('sudo NOPASSWD')
+    if r.has(r'/etc/shadow LEGIBLE', r'shadow.*legible'):
+        bonus += 8
+        bonus_reasons.append('shadow legible')
+    if r.has(r'IMDSv1 accesible SIN token'):
+        bonus += 6
+        bonus_reasons.append('IMDS sin token')
+    if r.has(r'Credenciales AWS IAM accesibles'):
+        bonus += 8
+        bonus_reasons.append('credenciales cloud')
+    if r.has(r'pam_permit sufficient'):
+        bonus += 10
+        bonus_reasons.append('PAM backdoor')
+
+    breakdown['contexto'] = min(bonus, 20)
+    if bonus_reasons:
+        breakdown['_bonus_por'] = ', '.join(bonus_reasons)
+
+    score = sum(v for k, v in breakdown.items() if not k.startswith('_'))
+    return min(score, 100), breakdown
+
+
+def risk_level(score: int) -> tuple[str, str]:
+    """Devuelve (nivel, color)."""
+    if score >= 70:
+        return 'CRÍTICO', C.RED
+    if score >= 40:
+        return 'ALTO', C.YELLOW
+    if score >= 15:
+        return 'MEDIO', C.CYAN
+    return 'BAJO', C.GREEN
+
+
+# ─── Renderizado ──────────────────────────────────────────────────────────────
+def render_header(r: Report):
+    print(f"\n{C.BOLD}{C.CYAN}══════════════════════════════════════════{C.RESET}")
+    print(f"{C.BOLD}{C.CYAN}  rh-analyze — Análisis de reporte{C.RESET}")
+    print(f"{C.BOLD}{C.CYAN}══════════════════════════════════════════{C.RESET}\n")
+    print(f"  Host       : {r.hostname}")
+    print(f"  OS         : {r.os}")
+    print(f"  Kernel     : {r.kernel}")
+    print(f"  Usuario    : {r.user}")
+    print(f"  Auditado   : {r.timestamp}")
+    print(f"  Hallazgos  : {len(r.critical())} críticos, "
+          f"{len(r.warnings())} advertencias\n")
+
+
+def render_score(r: Report):
+    score, breakdown = calculate_score(r)
+    level, color = risk_level(score)
+    print(f"{C.BOLD}── Puntuación de riesgo ──{C.RESET}")
+    print(f"  Score: {color}{C.BOLD}{score}/100 [{level}]{C.RESET}")
+    for k, v in breakdown.items():
+        if k.startswith('_'):
+            continue
+        print(f"    {k:.<20} +{v}")
+    if '_bonus_por' in breakdown:
+        print(f"  {C.DIM}Factores de contexto: {breakdown['_bonus_por']}{C.RESET}")
+    print()
+
+
+def render_exploits(r: Report):
+    print(f"{C.BOLD}── Exploits sugeridos ──{C.RESET}")
+    applicable = [e for e in EXPLOITS if e.applies(r)]
+    if not applicable:
+        print(f"  {C.GREEN}No hay coincidencias en la base de exploits.{C.RESET}")
+        print(f"  {C.DIM}Esto NO significa que el sistema sea seguro — solo que no")
+        print(f"  hay matches en los CVEs registrados localmente.{C.RESET}\n")
+        return
+
+    for e in applicable:
+        sev_color = C.RED if e.severity == 'critical' else C.YELLOW
+        print(f"\n  {sev_color}[{e.severity.upper()}]{C.RESET} {C.BOLD}{e.name}{C.RESET}")
+        print(f"    CVE/Ref     : {e.cve}")
+        print(f"    Descripción : {e.description}")
+        if e.requires:
+            print(f"    Requiere    : {e.requires}")
+        print(f"    PoC         : {C.CYAN}{e.poc_url}{C.RESET}")
+    print()
+
+
+def render_attack_paths(r: Report):
+    print(f"{C.BOLD}── Attack paths detectados ──{C.RESET}")
+    paths = find_attack_paths(r)
+    if not paths:
+        print(f"  {C.GREEN}No se construyeron rutas de escalada con los hallazgos actuales.{C.RESET}\n")
+        return
+
+    for i, p in enumerate(paths, 1):
+        sev_color = C.RED if p.severity == 'critical' else C.YELLOW
+        print(f"\n  {sev_color}[{p.severity.upper()}]{C.RESET} "
+              f"{C.BOLD}Path #{i}: {p.name}{C.RESET}")
+        for j, step in enumerate(p.steps, 1):
+            print(f"    {j}. {step}")
+        print(f"    {C.DIM}↳ Impacto: {p.impact}{C.RESET}")
+    print()
+
+
+def render_summary(r: Report):
+    """Resumen ejecutivo en una línea por sección."""
+    score, _ = calculate_score(r)
+    level, color = risk_level(score)
+    n_exploits = sum(1 for e in EXPLOITS if e.applies(r))
+    n_paths = len(find_attack_paths(r))
+
+    print(f"\n{C.BOLD}── Resumen ejecutivo ──{C.RESET}")
+    print(f"  Riesgo            : {color}{score}/100 [{level}]{C.RESET}")
+    print(f"  Exploits aplicables: {n_exploits}")
+    print(f"  Attack paths       : {n_paths}")
+    print(f"  Recomendación      : ", end='')
+    if score >= 70:
+        print(f"{C.RED}Remediar inmediatamente — múltiples vectores explotables{C.RESET}")
+    elif score >= 40:
+        print(f"{C.YELLOW}Priorizar remediación de hallazgos críticos{C.RESET}")
+    elif score >= 15:
+        print(f"{C.CYAN}Revisar advertencias y endurecer configuración{C.RESET}")
+    else:
+        print(f"{C.GREEN}Sistema con hardening razonable{C.RESET}")
+    print()
+
+
+# ─── Modo diff ────────────────────────────────────────────────────────────────
+def render_diff(old: Report, new: Report):
+    print(f"\n{C.BOLD}── Diff entre auditorías ──{C.RESET}")
+    print(f"  Antes : {old.timestamp}")
+    print(f"  Ahora : {new.timestamp}\n")
+
+    old_set = {(f.severity, f.text) for f in old.findings}
+    new_set = {(f.severity, f.text) for f in new.findings}
+
+    added = new_set - old_set
+    removed = old_set - new_set
+
+    added_crit = [t for s, t in added if s == 'critical']
+    removed_crit = [t for s, t in removed if s == 'critical']
+
+    if added_crit:
+        print(f"  {C.RED}{C.BOLD}Nuevos hallazgos críticos: {len(added_crit)}{C.RESET}")
+        for t in added_crit[:10]:
+            print(f"    {C.RED}+ {t}{C.RESET}")
+        if len(added_crit) > 10:
+            print(f"    {C.DIM}... y {len(added_crit) - 10} más{C.RESET}")
+        print()
+
+    if removed_crit:
+        print(f"  {C.GREEN}{C.BOLD}Críticos remediados: {len(removed_crit)}{C.RESET}")
+        for t in removed_crit[:10]:
+            print(f"    {C.GREEN}- {t}{C.RESET}")
+        print()
+
+    if not added_crit and not removed_crit:
+        print(f"  {C.CYAN}Sin cambios en hallazgos críticos.{C.RESET}\n")
+
+    # Cambio en score
+    score_old, _ = calculate_score(old)
+    score_new, _ = calculate_score(new)
+    delta = score_new - score_old
+    arrow = '↑' if delta > 0 else ('↓' if delta < 0 else '=')
+    color = C.RED if delta > 0 else (C.GREEN if delta < 0 else C.DIM)
+    print(f"  Score: {score_old} → {score_new} {color}{arrow} {abs(delta):+d}{C.RESET}\n")
+
+
+# ─── Modo batch ───────────────────────────────────────────────────────────────
+def render_batch(reports: list[Report]):
+    print(f"\n{C.BOLD}── Análisis batch — {len(reports)} hosts ──{C.RESET}\n")
+    rows = []
+    for r in reports:
+        score, _ = calculate_score(r)
+        level, _ = risk_level(score)
+        n_exp = sum(1 for e in EXPLOITS if e.applies(r))
+        n_paths = len(find_attack_paths(r))
+        rows.append((score, level, r.hostname, r.kernel, n_exp, n_paths))
+
+    rows.sort(key=lambda x: -x[0])  # Ordenar por score descendente
+
+    print(f"  {'Score':>5}  {'Nivel':<10} {'Hostname':<25} {'Kernel':<20} {'Expl':>4} {'Paths':>5}")
+    print(f"  {'-' * 5}  {'-' * 10} {'-' * 25} {'-' * 20} {'-' * 4} {'-' * 5}")
+    for score, level, host, kernel, n_exp, n_paths in rows:
+        _, color = risk_level(score)
+        print(f"  {color}{score:>5}{C.RESET}  {level:<10} "
+              f"{host[:25]:<25} {kernel[:20]:<20} {n_exp:>4} {n_paths:>5}")
+    print()
+
+
+# ─── Exportar Markdown ────────────────────────────────────────────────────────
+def export_markdown(r: Report, path: Path):
+    """Genera un reporte Markdown limpio para compartir."""
+    score, breakdown = calculate_score(r)
+    level, _ = risk_level(score)
+    applicable = [e for e in EXPLOITS if e.applies(r)]
+    paths = find_attack_paths(r)
+
+    md = []
+    md.append(f"# Análisis de seguridad — {r.hostname}\n")
+    md.append(f"**Generado por rh-analyze** sobre reporte de RootHunter\n")
+    md.append(f"## Resumen\n")
+    md.append(f"| Campo | Valor |")
+    md.append(f"|-------|-------|")
+    md.append(f"| Host | `{r.hostname}` |")
+    md.append(f"| OS | {r.os} |")
+    md.append(f"| Kernel | `{r.kernel}` |")
+    md.append(f"| Auditado | {r.timestamp} |")
+    md.append(f"| Score de riesgo | **{score}/100 [{level}]** |")
+    md.append(f"| Críticos | {len(r.critical())} |")
+    md.append(f"| Advertencias | {len(r.warnings())} |\n")
+
+    if applicable:
+        md.append(f"## Exploits sugeridos\n")
+        for e in applicable:
+            md.append(f"### {e.name}")
+            md.append(f"- **Severidad:** {e.severity}")
+            md.append(f"- **CVE/Ref:** {e.cve}")
+            md.append(f"- **Descripción:** {e.description}")
+            if e.requires:
+                md.append(f"- **Requiere:** {e.requires}")
+            md.append(f"- **PoC:** [{e.poc_url}]({e.poc_url})\n")
+
+    if paths:
+        md.append(f"## Attack paths\n")
+        for i, p in enumerate(paths, 1):
+            md.append(f"### Path #{i}: {p.name}")
+            md.append(f"**Severidad:** {p.severity}\n")
+            for j, step in enumerate(p.steps, 1):
+                md.append(f"{j}. {step}")
+            md.append(f"\n> **Impacto:** {p.impact}\n")
+
+    md.append(f"## Recomendaciones\n")
+    if score >= 70:
+        md.append("- **Acción inmediata requerida.** Múltiples vectores explotables detectados.")
+    elif score >= 40:
+        md.append("- Priorizar remediación de hallazgos críticos en las próximas 24-48h.")
+    else:
+        md.append("- Endurecer configuración según advertencias detectadas.")
+    md.append("- Re-auditar tras aplicar correcciones con `roothunter.sh -j` y comparar con `rh-analyze --diff`.\n")
+
+    path.write_text('\n'.join(md), encoding='utf-8')
+    print(f"  {C.GREEN}Reporte Markdown guardado en: {path}{C.RESET}")
+
+
+# ─── Main ─────────────────────────────────────────────────────────────────────
+def main():
+    parser = argparse.ArgumentParser(
+        description='Analizador de reportes RootHunter',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Ejemplos:
+  %(prog)s reporte.json
+  %(prog)s reporte.json --score
+  %(prog)s reporte.json --exploits --paths
+  %(prog)s --diff antes.json despues.json
+  %(prog)s --batch host1.json host2.json host3.json
+  %(prog)s reporte.json -o analisis.md
+        """,
+    )
+    parser.add_argument('reports', nargs='*', type=Path,
+                        help='Reportes JSON de RootHunter')
+    parser.add_argument('--score', action='store_true', help='Solo mostrar score')
+    parser.add_argument('--exploits', action='store_true', help='Solo exploits sugeridos')
+    parser.add_argument('--paths', action='store_true', help='Solo attack paths')
+    parser.add_argument('--diff', nargs=2, type=Path, metavar=('OLD', 'NEW'),
+                        help='Comparar dos reportes')
+    parser.add_argument('--batch', action='store_true',
+                        help='Procesar múltiples reportes y priorizar')
+    parser.add_argument('-o', '--output', type=Path,
+                        help='Exportar análisis a Markdown')
+    parser.add_argument('--no-color', action='store_true', help='Desactivar colores ANSI')
+
+    args = parser.parse_args()
+
+    if args.no_color or not sys.stdout.isatty():
+        C.disable()
+
+    # Modo diff
+    if args.diff:
+        old, new = Report.from_file(args.diff[0]), Report.from_file(args.diff[1])
+        render_diff(old, new)
+        return
+
+    # Sin reportes
+    if not args.reports:
+        parser.print_help()
+        sys.exit(1)
+
+    # Modo batch
+    if args.batch or len(args.reports) > 1:
+        reports = [Report.from_file(p) for p in args.reports]
+        render_batch(reports)
+        return
+
+    # Análisis simple
+    r = Report.from_file(args.reports[0])
+
+    if args.output:
+        export_markdown(r, args.output)
+        return
+
+    render_header(r)
+
+    # Si se especifican secciones, solo mostrar esas. Si no, todas.
+    show_all = not (args.score or args.exploits or args.paths)
+
+    if show_all or args.score:
+        render_score(r)
+    if show_all or args.exploits:
+        render_exploits(r)
+    if show_all or args.paths:
+        render_attack_paths(r)
+    if show_all:
+        render_summary(r)
+
+
+if __name__ == '__main__':
+    try:
+        main()
+    except KeyboardInterrupt:
+        sys.exit(130)
+    except json.JSONDecodeError as e:
+        print(f"{C.RED}Error: el archivo no es un JSON válido: {e}{C.RESET}", file=sys.stderr)
+        sys.exit(1)
+    except FileNotFoundError as e:
+        print(f"{C.RED}Error: archivo no encontrado: {e.filename}{C.RESET}", file=sys.stderr)
+        sys.exit(1)

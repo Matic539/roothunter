@@ -1,0 +1,17 @@
+# Reportes generados
+*.txt
+*.json
+*.log
+
+# Temp
+*.tmp
+*.bak
+*~
+
+# Editors
+.vscode/
+.idea/
+.claude/
+
+# copias
+roothunter_cpy.sh
