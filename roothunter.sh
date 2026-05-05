@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # =============================================================================
-#  roothunter.sh — Script de Auditoría de Seguridad Linux v1.1.0
+#  roothunter.sh — Script de Auditoría de Seguridad Linux v1.2.0
 #  Detecta vectores comunes de escalada de privilegios
 #  Autor: Matias López | Portafolio: github.com/Matic539
 #
@@ -42,6 +42,11 @@ INFOS=()
 _MOD_FINDINGS=(); _MOD_WARNINGS=(); _MOD_INFOS=()
 JSON_MODULES=()
 
+# Findings estructurados (nuevo schema v2). Cada elemento es un JSON-object string.
+# Se acumulan globalmente y también por módulo para mantener compatibilidad.
+STRUCTURED_FINDINGS=()
+_MOD_STRUCTURED=()
+
 
 
 # ─── Limpieza de temporales al salir ──────────────────────────────────────────
@@ -63,11 +68,15 @@ _tmp_file() {
 # ─── Argumentos ───────────────────────────────────────────────────────────────
 usage() {
   echo ""
-  echo -e "${BOLD}Uso:${RESET} $0 [-o archivo.txt] [-j archivo.json] [-m módulos] [-v] [-h]"
+  echo -e "${BOLD}Uso:${RESET} $0 [-o archivo.txt] [-j archivo.json] [-m módulos] [-v] [-V] [-h]"
   echo ""
   echo "  -o  Guardar reporte en texto plano"
   echo "  -j  Exportar reporte en JSON"
   echo "  -v  Modo verbose (referencias GTFOBins / HackTricks)"
+  echo "  -V  Verificar vectores: ejecuta precondition+capability de"
+  echo "      gtfobins.py para SUID/sudo/capabilities detectados, marcando"
+  echo "      'verified=true' en el JSON cuando el vector es real (opt-in)."
+  echo "      Alias largo: --verify-vectors"
   echo "  -m  Ejecutar solo módulos específicos (separados por coma)"
   echo "  -h  Esta ayuda"
   echo ""
@@ -88,6 +97,7 @@ usage() {
   echo "  cloud     → Credenciales IMDS cloud (nuevo)"
   echo "  systemd   → Units systemd escribibles (nuevo)"
   echo "  pam       → PAM backdoors y authorized_keys (nuevo)"
+  echo "  processes → Procesos root, sockets unix, configs shell (nuevo)"
   echo ""
   echo -e "${BOLD}Ejemplos:${RESET}"
   echo "  bash $0 -m suid,sudo,kernel"
@@ -96,12 +106,29 @@ usage() {
   exit 0
 }
 
-while getopts ":o:j:m:vh" opt; do
+# Variables globales (resto)
+VERIFY_VECTORS=false
+
+# Pre-procesamiento: convertir long options a short antes de getopts
+# (bash getopts no soporta long options nativamente)
+ARGS=()
+for arg in "$@"; do
+  case "$arg" in
+    --verify-vectors) ARGS+=("-V") ;;
+    --help)           ARGS+=("-h") ;;
+    --verbose)        ARGS+=("-v") ;;
+    *)                ARGS+=("$arg") ;;
+  esac
+done
+set -- "${ARGS[@]}"
+
+while getopts ":o:j:m:vVh" opt; do
   case $opt in
     o) OUTPUT_FILE="$OPTARG" ;;
     j) JSON_FILE="$OPTARG" ;;
     m) SELECTED_MODULES="$OPTARG" ;;
     v) VERBOSE=true ;;
+    V) VERIFY_VECTORS=true ;;
     h) usage ;;
     *) usage ;;
   esac
@@ -153,9 +180,206 @@ json_escape() {
   echo "$s"
 }
 
+# add_finding: registra un hallazgo estructurado.
+# Uso:
+#   add_finding <type> <severity> <message> [key1=value1] [key2=value2] ...
+#
+# severity: critical | warning | info
+# El finding se acumula tanto en STRUCTURED_FINDINGS (global) como en
+# _MOD_STRUCTURED (por módulo, para volcar al JSON del módulo en flush).
+#
+# Esta función NO imprime nada — la impresión sigue siendo responsabilidad
+# de mod_critical/mod_warning/mod_info para mantener compatibilidad textual.
+add_finding() {
+  local type="$1"; shift
+  local severity="$1"; shift
+  local message="$1"; shift
+
+  local data_json="{" first=true
+  for kv in "$@"; do
+    local k="${kv%%=*}" v="${kv#*=}"
+    [[ "$k" == "$kv" ]] && continue  # no '=' en el arg, lo ignoramos
+    $first || data_json+=","
+    data_json+="\"$(json_escape "$k")\":\"$(json_escape "$v")\""
+    first=false
+  done
+  data_json+="}"
+
+  local finding_json
+  finding_json="{\"type\":\"$(json_escape "$type")\",\"severity\":\"$(json_escape "$severity")\",\"message\":\"$(json_escape "$message")\",\"data\":$data_json}"
+
+  STRUCTURED_FINDINGS+=("$finding_json")
+  _MOD_STRUCTURED+=("$finding_json")
+}
+
+# ─── Verificación de vectores (opt-in, --verify-vectors) ──────────────────────
+# Cuando -V está activo, ejecutamos los niveles 'precondition' y 'capability'
+# de gtfobins.py para confirmar que el vector es real, no solo posible.
+#
+# Requisitos:
+#   - python3 disponible en el host
+#   - gtfobins.py presente en el mismo directorio que este script
+#
+# El resultado se devuelve como string serializable que se mete en data:
+#   verified=true|false|unknown
+#   verified_at_level=precondition|capability|none
+#   verify_output=<primera línea del output del último chequeo>
+#
+# Si gtfobins.py no está accesible, devolvemos verified=unknown sin error.
+
+# Path de gtfobins.py: mismo directorio que el script
+_GTFOBINS_PATH=""
+_init_gtfobins_path() {
+  local script_dir
+  script_dir=$(dirname "$(readlink -f "$0" 2>/dev/null || echo "$0")")
+  if [[ -f "$script_dir/gtfobins.py" ]]; then
+    _GTFOBINS_PATH="$script_dir/gtfobins.py"
+  fi
+}
+_init_gtfobins_path
+
+# _verify_vector — intenta verificar precondition y capability para
+#   un vector dado. Argumentos:
+#     $1 = kind ('suid' | 'sudo' | 'capability')
+#     $2 = binary (nombre del binario, ej 'find', 'python3')
+#     $3 = (opcional) capability name si kind=capability (ej 'cap_setuid')
+#
+# Imprime tres líneas en stdout:
+#     verified=true|false|unknown
+#     verified_at_level=precondition|capability|none
+#     verify_output=<una línea>
+#
+# Lógica:
+#   - precondition: el output debe matchear el patrón esperado
+#     (para SUID: stat debe mostrar bit 4xxx, no 0755)
+#   - capability: idem (debe ver CAPABILITY_OK o equivalente)
+#   - Si precondition falla, vector NO viable → verified=false
+#   - Si precondition pasa pero capability falla, viable parcial → verified=true (precondition)
+#   - Si ambos pasan, vector confirmado → verified=true (capability)
+_verify_vector() {
+  local kind="$1"
+  local binary="$2"
+  local cap_name="${3:-}"
+
+  if [[ -z "$_GTFOBINS_PATH" ]] || ! command -v python3 &>/dev/null; then
+    echo "verified=unknown"
+    echo "verified_at_level=none"
+    echo "verify_output=gtfobins.py o python3 no disponible"
+    return
+  fi
+
+  # Pedimos a python3 los comandos para los niveles precondition + capability,
+  # más el patrón esperado de cada uno.
+  local cmds_tmp
+  cmds_tmp=$(_tmp_file)
+  python3 - "$_GTFOBINS_PATH" "$kind" "$binary" "$cap_name" > "$cmds_tmp" 2>/dev/null <<'PYEOF'
+import sys, importlib.util
+gtf_path, kind, binary, cap_name = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
+spec = importlib.util.spec_from_file_location('gtfobins', gtf_path)
+g = importlib.util.module_from_spec(spec); spec.loader.exec_module(g)
+
+if kind == 'suid':
+    tech = g.SUID.get(binary)
+elif kind == 'sudo':
+    tech = g.SUDO.get(binary)
+elif kind == 'capability':
+    cap = g.CAPABILITIES.get(cap_name, {})
+    tech = cap.get('exploits', {}).get(binary)
+else:
+    tech = None
+
+if not tech:
+    sys.exit(0)
+
+# Imprimir cada nivel en formato "level<TAB>cmd<TAB>expected"
+for level, cmd, expected in g.get_verify_levels(tech):
+    if level in ('precondition', 'capability'):
+        clean_cmd = cmd.replace('\t', ' ')
+        clean_exp = (expected or '').replace('\t', ' ')
+        print(f"{level}\t{clean_cmd}\t{clean_exp}")
+PYEOF
+
+  # Lógica de validación por nivel:
+  # Para cada nivel evaluamos si el output indica un match real:
+  #
+  # - precondition para SUID/sudo: el comando es típicamente stat o sudo -nl
+  #   con un grep. Output válido = línea NO vacía. Pero para SUID de stat,
+  #   debemos chequear que el modo tenga bit '4' en el dígito SUID.
+  #
+  # - capability: sale "CAPABILITY_OK" u "OK" en stdout.
+  #
+  # Estrategia simple: extraemos un "expected_pattern" del campo expected
+  # de gtfobins. Por ahora aplicamos heurísticas:
+  #   * Si expected menciona "4xxx" → el output debe contener "4" en posición
+  #     correcta del modo (stat output).
+  #   * Si expected menciona "CAPABILITY_OK" → el output debe contenerlo.
+  #   * Si expected menciona "NOPASSWD" → el output debe contenerlo.
+  #   * En caso default, basta con output no vacío.
+  local precond_pass=false cap_pass=false
+  local last_level="none" last_output=""
+
+  while IFS=$'\t' read -r level cmd expected; do
+    [[ -z "$level" || -z "$cmd" ]] && continue
+    local out
+    out=$(timeout 5 bash -c "$cmd" 2>&1 | head -1 | head -c 200)
+    [[ -z "$out" ]] && continue
+
+    # Decidir si el output cumple lo esperado
+    local matches=false
+    if [[ "$expected" == *"4xxx"* ]]; then
+      # Para SUID: stat -c "%U %a" debe mostrar usuario y modo con bit SUID activo.
+      # El bit SUID está en el primer dígito del modo (4=SUID, 6=SUID+SGID, 7=todos).
+      # Modos válidos: 4xxx, 6xxx, 7xxx (3 dígitos) o 04xxx, 06xxx, 07xxx (4 dígitos).
+      # Modos sin SUID: 0xxx, 1xxx, 2xxx, 3xxx, o 0(0-3)xxx con 4 dígitos.
+      if echo "$out" | grep -qE '^\S+ +([46-7]|0[46-7])[0-7]{3}$'; then
+        matches=true
+      fi
+    elif [[ "$expected" == *"CAPABILITY_OK"* ]]; then
+      echo "$out" | grep -q "CAPABILITY_OK" && matches=true
+    elif [[ "$expected" == *"NOPASSWD"* ]]; then
+      echo "$out" | grep -q "NOPASSWD" && matches=true
+    elif [[ "$expected" == *"línea con cap_"* ]]; then
+      # Capability check vía getcap: output debería contener cap_<algo>=
+      echo "$out" | grep -qE 'cap_\w+(\+|=)' && matches=true
+    elif [[ "$expected" == *"OK"* ]]; then
+      # genérico: output contiene "OK"
+      echo "$out" | grep -q "OK" && matches=true
+    else
+      # Si no hay heurística específica, ser conservadores: requerir que el
+      # comando haya devuelto contenido NO vacío y NO sea un mensaje de error obvio.
+      if ! echo "$out" | grep -qiE '^(error|permission denied|command not found|no such)'; then
+        matches=true
+      fi
+    fi
+
+    if $matches; then
+      case "$level" in
+        precondition) precond_pass=true ;;
+        capability)   cap_pass=true ;;
+      esac
+      last_level="$level"
+      last_output="$out"
+    fi
+  done < "$cmds_tmp"
+
+  # Decisión final:
+  #   - Sin precondition pasada → vector NO viable → verified=false
+  #     (el binario detectado no tiene ya el SUID/sudo/capability esperado)
+  #   - Con precondition pero sin capability → verified=true (parcial)
+  #   - Ambas pasaron → verified=true (confirmado)
+  local verified="false"
+  if $precond_pass; then
+    verified="true"
+  fi
+
+  echo "verified=$verified"
+  echo "verified_at_level=$last_level"
+  echo "verify_output=$last_output"
+}
+
 flush_module_json() {
   local module_name="$1"
-  local f_json="[" w_json="[" i_json="["
+  local f_json="[" w_json="[" i_json="[" s_json="["
   local first=true
 
   for item in "${_MOD_FINDINGS[@]+"${_MOD_FINDINGS[@]}"}"; do
@@ -168,10 +392,15 @@ flush_module_json() {
 
   for item in "${_MOD_INFOS[@]+"${_MOD_INFOS[@]}"}"; do
     $first || i_json+=","; i_json+="\"$(json_escape "$item")\""; first=false
-  done; i_json+="]"
+  done; i_json+="]"; first=true
 
-  JSON_MODULES+=("{\"module\":\"$(json_escape "$module_name")\",\"critical\":$f_json,\"warnings\":$w_json,\"info\":$i_json}")
-  _MOD_FINDINGS=(); _MOD_WARNINGS=(); _MOD_INFOS=()
+  # Findings estructurados — ya son JSON object strings, no se escapan otra vez
+  for item in "${_MOD_STRUCTURED[@]+"${_MOD_STRUCTURED[@]}"}"; do
+    $first || s_json+=","; s_json+="$item"; first=false
+  done; s_json+="]"
+
+  JSON_MODULES+=("{\"module\":\"$(json_escape "$module_name")\",\"critical\":$f_json,\"warnings\":$w_json,\"info\":$i_json,\"findings\":$s_json}")
+  _MOD_FINDINGS=(); _MOD_WARNINGS=(); _MOD_INFOS=(); _MOD_STRUCTURED=()
 }
 
 _run_module() {
@@ -206,9 +435,25 @@ check_system_info() {
   mod_info "Grupos      : $(id -Gn)"
   mod_info "SHA256 script: $SCRIPT_SHA256"
 
+  # Detectar versión de glibc — relevante para CVE-2023-4911 Looney Tunables
+  local glibc_ver=""
+  if command -v ldd &>/dev/null; then
+    glibc_ver=$(ldd --version 2>/dev/null | head -1 | grep -oE '[0-9]+\.[0-9]+(\.[0-9]+)?' | head -1 || echo "")
+  fi
+  if [[ -z "$glibc_ver" && -f /lib/x86_64-linux-gnu/libc.so.6 ]]; then
+    glibc_ver=$(/lib/x86_64-linux-gnu/libc.so.6 2>/dev/null | head -1 | grep -oE '[0-9]+\.[0-9]+' | head -1 || echo "")
+  fi
+  if [[ -n "$glibc_ver" ]]; then
+    mod_info "glibc       : $glibc_ver"
+    add_finding "glibc_version" "info" "glibc versión: $glibc_ver" "version=$glibc_ver"
+  fi
+
   # Detectar si estamos dentro de un contenedor (informativo aquí, detallado en módulo containers)
   if [[ -f /.dockerenv ]] || grep -qE 'docker|lxc|containerd' /proc/1/cgroup 2>/dev/null; then
     mod_warning "Entorno detectado: posiblemente DENTRO DE UN CONTENEDOR"
+    add_finding "container_detected" "warning" \
+      "Entorno detectado: posiblemente DENTRO DE UN CONTENEDOR" \
+      "indicator=cgroup_or_dockerenv"
   fi
 
   flush_module_json "Sistema"
@@ -254,8 +499,32 @@ check_suid_sgid() {
     if $is_dangerous; then
       mod_critical "SUID peligroso: $bin (owner: $owner, perms: $perms)"
       print_verbose "GTFOBins: https://gtfobins.github.io/gtfobins/$name/"
+      # Verificación opcional opt-in
+      local verify_kv=()
+      if $VERIFY_VECTORS; then
+        local vout
+        vout=$(_verify_vector "suid" "$name")
+        while IFS= read -r vline; do
+          [[ -n "$vline" ]] && verify_kv+=("$vline")
+        done <<< "$vout"
+        # Mostrar resultado en consola
+        local vstatus
+        vstatus=$(echo "$vout" | grep '^verified=' | cut -d= -f2)
+        case "$vstatus" in
+          true)    print_verbose "✓ Verificado: vector confirmado en gtfobins.py" ;;
+          false)   print_verbose "✗ No verificado: chequeos no concluyentes" ;;
+          unknown) print_verbose "? Sin verificar: gtfobins.py o python3 no disponible" ;;
+        esac
+      fi
+      add_finding "suid_dangerous" "critical" \
+        "SUID peligroso: $bin (owner: $owner, perms: $perms)" \
+        "binary=$name" "path=$bin" "owner=$owner" "perms=$perms" \
+        "${verify_kv[@]+"${verify_kv[@]}"}"
     else
       mod_warning "SUID encontrado: $bin (owner: $owner)"
+      add_finding "suid_unusual" "warning" \
+        "SUID encontrado: $bin (owner: $owner)" \
+        "binary=$name" "path=$bin" "owner=$owner" "perms=$perms"
     fi
   done < "$suid_tmp"
 
@@ -270,7 +539,13 @@ check_suid_sgid() {
   while IFS= read -r bin; do
     [[ -z "$bin" ]] && continue
     sgid_count=$((sgid_count + 1))
-    mod_warning "SGID: $bin (owner: $(stat -c '%U:%G' "$bin" 2>/dev/null || echo '?'))"
+    local sgid_name sgid_owner_group
+    sgid_name=$(basename "$bin" 2>/dev/null) || sgid_name="?"
+    sgid_owner_group=$(stat -c '%U:%G' "$bin" 2>/dev/null || echo '?')
+    mod_warning "SGID: $bin (owner: $sgid_owner_group)"
+    add_finding "sgid_binary" "warning" \
+      "SGID: $bin (owner: $sgid_owner_group)" \
+      "binary=$sgid_name" "path=$bin" "owner_group=$sgid_owner_group"
   done < "$sgid_tmp"
   mod_info "Total SGID: $sgid_count"
 
@@ -278,6 +553,72 @@ check_suid_sgid() {
 }
 
 # ─── 3. Sudo ──────────────────────────────────────────────────────────────────
+# Helper: parsea una línea de sudo -l y emite un finding por cada binario.
+# Formato típico: "    (ALL : ALL) NOPASSWD: /usr/bin/find, /usr/bin/vim"
+# o también:      "    (root) /usr/bin/less *"
+_parse_sudo_line() {
+  local line="$1" source="$2"
+  # Extraer el RunAs (entre paréntesis) — opcional pero útil
+  local runas=""
+  if [[ "$line" =~ \(([^\)]+)\) ]]; then
+    runas="${BASH_REMATCH[1]}"
+  fi
+  # Detectar NOPASSWD
+  local nopasswd="false"
+  echo "$line" | grep -qi "NOPASSWD" && nopasswd="true"
+
+  # La parte después del último ':' o '))' contiene los comandos
+  local cmds_part="$line"
+  if [[ "$line" == *":"* ]]; then
+    cmds_part="${line##*:}"
+  elif [[ "$line" == *")"* ]]; then
+    cmds_part="${line##*)}"
+  fi
+  cmds_part="${cmds_part#"${cmds_part%%[![:space:]]*}"}"  # ltrim
+
+  # Split por coma — cada item es un comando permitido
+  local IFS_OLD="$IFS"; IFS=','
+  local cmds_array=($cmds_part)
+  IFS="$IFS_OLD"
+
+  for cmd_full in "${cmds_array[@]}"; do
+    # Limpiar espacios
+    cmd_full="${cmd_full#"${cmd_full%%[![:space:]]*}"}"
+    cmd_full="${cmd_full%"${cmd_full##*[![:space:]]}"}"
+    [[ -z "$cmd_full" ]] && continue
+
+    # Extraer path del binario (primera "palabra" del comando)
+    local bin_path bin_name args has_wildcard="false"
+    bin_path="${cmd_full%% *}"
+    bin_name=$(basename "$bin_path" 2>/dev/null || echo "$bin_path")
+    args="${cmd_full#"$bin_path"}"
+    args="${args#"${args%%[![:space:]]*}"}"
+    [[ "$cmd_full" == *"*"* ]] && has_wildcard="true"
+
+    # Severidad: NOPASSWD eleva a crítico; con password queda warning informativo
+    local sev="warning"
+    [[ "$nopasswd" == "true" ]] && sev="critical"
+
+    # Verificación opt-in (solo si NOPASSWD: con password no se puede chequear sin
+    # interacción del usuario)
+    local verify_kv=()
+    if $VERIFY_VECTORS && [[ "$nopasswd" == "true" ]]; then
+      local vout
+      vout=$(_verify_vector "sudo" "$bin_name")
+      while IFS= read -r vline; do
+        [[ -n "$vline" ]] && verify_kv+=("$vline")
+      done <<< "$vout"
+    fi
+
+    add_finding "sudo_rule" "$sev" \
+      "Sudo: $cmd_full (NOPASSWD=$nopasswd, source=$source)" \
+      "binary=$bin_name" "path=$bin_path" "args=$args" \
+      "nopasswd=$nopasswd" "runas=$runas" \
+      "wildcard=$has_wildcard" "source=$source" \
+      "${verify_kv[@]+"${verify_kv[@]}"}"
+  done
+}
+
 check_sudo() {
   print_header "3. CONFIGURACIÓN SUDO"
   _MOD_FINDINGS=(); _MOD_WARNINGS=(); _MOD_INFOS=()
@@ -286,21 +627,42 @@ check_sudo() {
     mod_info "sudo no instalado"; flush_module_json "Sudo"; return
   fi
 
+  # Versión de sudo (importante para CVEs como Baron Samedit y CVE-2023-22809)
+  local sudo_ver
+  sudo_ver=$(sudo -V 2>/dev/null | head -1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+(p[0-9]+)?' | head -1 || echo "")
+  if [[ -n "$sudo_ver" ]]; then
+    mod_info "sudo versión: $sudo_ver"
+    add_finding "sudo_version" "info" "sudo versión: $sudo_ver" "version=$sudo_ver"
+  fi
+
   if sudo -n -l 2>/dev/null | grep -q "may run" 2>/dev/null; then
     mod_critical "El usuario puede ejecutar sudo SIN contraseña"
+    add_finding "sudo_nopasswd_available" "critical" \
+      "El usuario puede ejecutar sudo SIN contraseña" \
+      "user=$(whoami)"
     while IFS= read -r line; do
-      [[ -n "$line" && ! "$line" =~ ^(Matching|User|Defaults) ]] && mod_critical "  → $line"
+      [[ -z "$line" || "$line" =~ ^(Matching|User|Defaults) ]] && continue
+      mod_critical "  → $line"
+      _parse_sudo_line "$line" "sudo -l"
     done < <(sudo -n -l 2>/dev/null || true)
   else
     mod_info "sudo requiere contraseña o no hay permisos configurados"
   fi
 
-  id -nG 2>/dev/null | grep -qE '\bsudo\b|\bwheel\b|\badmin\b' && \
-    mod_warning "Grupo privilegiado: $(id -nG 2>/dev/null | tr ' ' '\n' | grep -E 'sudo|wheel|admin' | tr '\n' ' ')" || true
+  # Grupo privilegiado
+  local priv_groups
+  priv_groups=$(id -nG 2>/dev/null | tr ' ' '\n' | grep -E '^(sudo|wheel|admin)$' | tr '\n' ' ' | sed 's/ $//')
+  if [[ -n "$priv_groups" ]]; then
+    mod_warning "Grupo privilegiado: $priv_groups"
+    add_finding "privileged_group_membership" "warning" \
+      "Usuario en grupo privilegiado: $priv_groups" \
+      "groups=$priv_groups"
+  fi
 
   if [[ -r /etc/sudoers ]]; then
     while IFS= read -r line; do
       mod_critical "NOPASSWD en /etc/sudoers: $line"
+      _parse_sudo_line "$line" "/etc/sudoers"
     done < <(grep -i "NOPASSWD" /etc/sudoers 2>/dev/null | grep -v "^#" || true)
   fi
 
@@ -309,6 +671,7 @@ check_sudo() {
       [[ -r "$f" ]] || continue
       while IFS= read -r line; do
         mod_critical "NOPASSWD en $f: $line"
+        _parse_sudo_line "$line" "$f"
       done < <(grep -i "NOPASSWD" "$f" 2>/dev/null | grep -v "^#" || true)
     done
   fi
@@ -329,17 +692,33 @@ check_cron() {
 
   for path in "${cron_paths[@]}"; do
     if [[ -f "$path" ]]; then
-      mod_info "Cron: $path (owner: $(stat -c '%U' "$path" 2>/dev/null || echo '?'))"
+      local cron_owner; cron_owner=$(stat -c '%U' "$path" 2>/dev/null || echo '?')
+      mod_info "Cron: $path (owner: $cron_owner)"
       while IFS= read -r script; do
-        [[ -f "$script" && -w "$script" ]] && mod_critical "Script cron ESCRIBIBLE: $script"
+        if [[ -f "$script" && -w "$script" ]]; then
+          mod_critical "Script cron ESCRIBIBLE: $script"
+          local script_owner; script_owner=$(stat -c '%U' "$script" 2>/dev/null || echo '?')
+          add_finding "cron_writable_script" "critical" \
+            "Script cron ESCRIBIBLE: $script (referenciado en $path)" \
+            "script=$script" "cron_source=$path" \
+            "cron_owner=$cron_owner" "script_owner=$script_owner"
+        fi
       done < <(grep -oP '(/[^\s]+)' "$path" 2>/dev/null || true)
 
     elif [[ -d "$path" ]]; then
       for f in "$path"/*; do
         [[ -f "$f" ]] || continue
-        mod_info "Cron job: $f (owner: $(stat -c '%U' "$f" 2>/dev/null || echo '?'))"
+        local cron_owner; cron_owner=$(stat -c '%U' "$f" 2>/dev/null || echo '?')
+        mod_info "Cron job: $f (owner: $cron_owner)"
         while IFS= read -r script; do
-          [[ -f "$script" && -w "$script" ]] && mod_critical "Script cron ESCRIBIBLE: $script (en $f)"
+          if [[ -f "$script" && -w "$script" ]]; then
+            mod_critical "Script cron ESCRIBIBLE: $script (en $f)"
+            local script_owner; script_owner=$(stat -c '%U' "$script" 2>/dev/null || echo '?')
+            add_finding "cron_writable_script" "critical" \
+              "Script cron ESCRIBIBLE: $script (en $f)" \
+              "script=$script" "cron_source=$f" \
+              "cron_owner=$cron_owner" "script_owner=$script_owner"
+          fi
         done < <(grep -oP '(/[^\s]+)' "$f" 2>/dev/null || true)
       done
     fi
@@ -361,32 +740,64 @@ check_file_permissions() {
   print_header "5. ARCHIVOS SENSIBLES Y PERMISOS"
   _MOD_FINDINGS=(); _MOD_WARNINGS=(); _MOD_INFOS=()
 
-  [[ -w /etc/passwd ]] \
-    && mod_critical "/etc/passwd ESCRIBIBLE — inyección de usuario root posible" \
-    || mod_ok "/etc/passwd: solo lectura"
+  if [[ -w /etc/passwd ]]; then
+    mod_critical "/etc/passwd ESCRIBIBLE — inyección de usuario root posible"
+    add_finding "passwd_writable" "critical" \
+      "/etc/passwd ESCRIBIBLE — inyección de usuario root posible" \
+      "path=/etc/passwd"
+  else
+    mod_ok "/etc/passwd: solo lectura"
+  fi
 
-  [[ -r /etc/shadow ]] \
-    && mod_critical "/etc/shadow LEGIBLE — hashes expuestos" \
-    || mod_ok "/etc/shadow: no accesible"
+  if [[ -r /etc/shadow ]]; then
+    mod_critical "/etc/shadow LEGIBLE — hashes expuestos"
+    add_finding "shadow_readable" "critical" \
+      "/etc/shadow LEGIBLE — hashes expuestos" \
+      "path=/etc/shadow"
+  else
+    mod_ok "/etc/shadow: no accesible"
+  fi
 
   for dir in /root/.ssh /home/*/.ssh; do
     [[ -d "$dir" ]] || continue
     local perms; perms=$(stat -c '%a' "$dir" 2>/dev/null || echo "?")
-    [[ "$perms" != "700" && "$perms" != "600" ]] && mod_warning "Permisos débiles en $dir ($perms)"
+    if [[ "$perms" != "700" && "$perms" != "600" ]]; then
+      mod_warning "Permisos débiles en $dir ($perms)"
+      add_finding "ssh_dir_weak_perms" "warning" \
+        "Permisos débiles en $dir ($perms)" \
+        "path=$dir" "perms=$perms"
+    fi
     for key in "$dir"/id_rsa "$dir"/id_ed25519 "$dir"/id_ecdsa "$dir"/id_dsa; do
-      [[ -f "$key" && -r "$key" ]] && mod_critical "Clave SSH privada legible: $key"
+      if [[ -f "$key" && -r "$key" ]]; then
+        mod_critical "Clave SSH privada legible: $key"
+        local key_owner; key_owner=$(stat -c '%U' "$key" 2>/dev/null || echo '?')
+        local key_type; key_type=$(basename "$key")
+        add_finding "ssh_private_key_readable" "critical" \
+          "Clave SSH privada legible: $key" \
+          "path=$key" "owner=$key_owner" "key_type=$key_type"
+      fi
     done
   done
 
   while IFS= read -r dir; do
-    [[ -n "$dir" ]] && mod_critical "Directorio world-writable en ruta del sistema: $dir"
+    if [[ -n "$dir" ]]; then
+      mod_critical "Directorio world-writable en ruta del sistema: $dir"
+      add_finding "system_dir_writable" "critical" \
+        "Directorio world-writable en ruta del sistema: $dir" \
+        "path=$dir"
+    fi
   done < <(find /etc /usr /bin /sbin /lib -maxdepth 2 -writable -type d 2>/dev/null || true)
 
   for f in /etc/mysql/my.cnf /var/www/html/wp-config.php ~/.aws/credentials ~/.docker/config.json; do
     [[ -f "$f" && -r "$f" ]] || continue
     mod_warning "Config legible: $f"
+    add_finding "config_file_readable" "warning" \
+      "Config legible: $f" "path=$f"
     while IFS= read -r line; do
       mod_critical "Posible credencial en $f: ${line:0:80}"
+      add_finding "credential_in_config" "critical" \
+        "Posible credencial en $f: ${line:0:80}" \
+        "path=$f" "preview=${line:0:80}"
     done < <(grep -iE "(password|secret|token|key)\s*[=:]" "$f" 2>/dev/null | grep -v "^#" | head -3 || true)
   done
 
@@ -417,12 +828,60 @@ check_capabilities() {
   else
     while IFS= read -r line; do
       [[ -z "$line" ]] && continue
-      local cap is_dangerous=false
-      cap=$(echo "$line" | awk '{print $2, $3}' 2>/dev/null || echo "")
+      # Formato típico: "/usr/bin/python3.10 cap_setuid,cap_setgid+ep"
+      # o (más viejo):  "/usr/bin/python3.10 = cap_setuid+ep"
+      local bin_path caps_field bin_name
+      bin_path=$(echo "$line" | awk '{print $1}')
+      caps_field=$(echo "$line" | awk '{for(i=2;i<=NF;i++) printf "%s%s", $i, (i<NF?" ":"")}')
+      # Normalizar: quitar '=' opcional
+      caps_field="${caps_field#= }"
+      # Solo la parte antes del flag (+ep, +ei, etc.)
+      local caps_only="${caps_field%%+*}"
+      bin_name=$(basename "$bin_path" 2>/dev/null || echo "$bin_path")
+
+      local is_dangerous=false matched_cap=""
       for dc in "${dangerous_caps[@]}"; do
-        echo "$cap" | grep -qi "$dc" 2>/dev/null && is_dangerous=true && break
+        if echo "$caps_only" | grep -qi "$dc" 2>/dev/null; then
+          is_dangerous=true
+          matched_cap="$dc"
+          break
+        fi
       done
-      $is_dangerous && mod_critical "Capability peligrosa: $line" || mod_warning "Capability: $line"
+
+      if $is_dangerous; then
+        mod_critical "Capability peligrosa: $line"
+        # Para capabilities, el matching del bin_name debe ser flexible:
+        # python3.10 → python3 → python (ya implementado en rh-analyze).
+        # Aquí solo probamos el nombre tal cual; el analyzer rebajará si falla.
+        local verify_kv=()
+        if $VERIFY_VECTORS; then
+          local vout
+          vout=$(_verify_vector "capability" "$bin_name" "$matched_cap")
+          # Si el bin_name no matchea exacto (ej python3.10), probar simplificado
+          local vstatus
+          vstatus=$(echo "$vout" | grep '^verified=' | cut -d= -f2)
+          if [[ "$vstatus" != "true" ]]; then
+            local simplified="${bin_name//[0-9.]/}"
+            if [[ "$simplified" != "$bin_name" && -n "$simplified" ]]; then
+              vout=$(_verify_vector "capability" "$simplified" "$matched_cap")
+            fi
+          fi
+          while IFS= read -r vline; do
+            [[ -n "$vline" ]] && verify_kv+=("$vline")
+          done <<< "$vout"
+        fi
+        add_finding "capability_dangerous" "critical" \
+          "Capability peligrosa: $line" \
+          "binary=$bin_name" "path=$bin_path" \
+          "capability=$matched_cap" "caps_full=$caps_field" \
+          "${verify_kv[@]+"${verify_kv[@]}"}"
+      else
+        mod_warning "Capability: $line"
+        add_finding "capability_other" "warning" \
+          "Capability: $line" \
+          "binary=$bin_name" "path=$bin_path" \
+          "caps_full=$caps_field"
+      fi
     done <<< "$caps_list"
   fi
 
@@ -436,41 +895,73 @@ check_kernel() {
 
   local kernel; kernel=$(uname -r 2>/dev/null || echo "desconocido")
   mod_info "Kernel: $kernel"
+  # Versión "limpia": 5.15.0-91-generic -> 5.15.0
+  local kernel_clean
+  kernel_clean=$(echo "$kernel" | grep -oE '^[0-9]+\.[0-9]+\.[0-9]+' || echo "$kernel")
+  add_finding "kernel_version" "info" "Kernel: $kernel" \
+    "version_full=$kernel" "version=$kernel_clean"
 
   # Protecciones del kernel
   if [[ -f /proc/sys/kernel/randomize_va_space ]]; then
     local aslr; aslr=$(cat /proc/sys/kernel/randomize_va_space 2>/dev/null || echo "?")
     case $aslr in
-      2) mod_ok "ASLR: Completo (nivel 2)" ;;
-      1) mod_warning "ASLR: Parcial (nivel 1)" ;;
-      0) mod_critical "ASLR: DESHABILITADO" ;;
+      2) mod_ok "ASLR: Completo (nivel 2)"
+         add_finding "kernel_protection" "info" "ASLR completo (2)" "name=aslr" "value=2" "status=ok" ;;
+      1) mod_warning "ASLR: Parcial (nivel 1)"
+         add_finding "kernel_protection_weak" "warning" "ASLR parcial (1)" "name=aslr" "value=1" "status=partial" ;;
+      0) mod_critical "ASLR: DESHABILITADO"
+         add_finding "kernel_protection_weak" "critical" "ASLR deshabilitado" "name=aslr" "value=0" "status=disabled" ;;
       *) mod_info "ASLR: valor desconocido ($aslr)" ;;
     esac
   fi
 
   if [[ -f /proc/sys/kernel/dmesg_restrict ]]; then
     local dmesg; dmesg=$(cat /proc/sys/kernel/dmesg_restrict 2>/dev/null || echo "?")
-    [[ "$dmesg" == "0" ]] \
-      && mod_warning "dmesg_restrict: deshabilitado" \
-      || mod_ok "dmesg_restrict: habilitado ($dmesg)"
+    if [[ "$dmesg" == "0" ]]; then
+      mod_warning "dmesg_restrict: deshabilitado"
+      add_finding "kernel_protection_weak" "warning" "dmesg_restrict deshabilitado" \
+        "name=dmesg_restrict" "value=0" "status=disabled"
+    else
+      mod_ok "dmesg_restrict: habilitado ($dmesg)"
+    fi
   fi
 
   if [[ -f /proc/sys/kernel/yama/ptrace_scope ]]; then
     local ptrace; ptrace=$(cat /proc/sys/kernel/yama/ptrace_scope 2>/dev/null || echo "?")
-    [[ "$ptrace" == "0" ]] \
-      && mod_warning "ptrace_scope: 0 — procesos trazables por cualquier usuario" \
-      || mod_ok "ptrace_scope: $ptrace (restringido)"
+    if [[ "$ptrace" == "0" ]]; then
+      mod_warning "ptrace_scope: 0 — procesos trazables por cualquier usuario"
+      add_finding "kernel_protection_weak" "warning" "ptrace_scope=0" \
+        "name=ptrace_scope" "value=0" "status=disabled"
+    else
+      mod_ok "ptrace_scope: $ptrace (restringido)"
+    fi
   fi
 
   # Protecciones adicionales
   if [[ -f /proc/sys/fs/protected_symlinks ]]; then
     local sl; sl=$(cat /proc/sys/fs/protected_symlinks 2>/dev/null || echo "?")
-    [[ "$sl" == "0" ]] && mod_warning "protected_symlinks: deshabilitado — symlink races posibles"
+    if [[ "$sl" == "0" ]]; then
+      mod_warning "protected_symlinks: deshabilitado — symlink races posibles"
+      add_finding "kernel_protection_weak" "warning" "protected_symlinks deshabilitado" \
+        "name=protected_symlinks" "value=0" "status=disabled"
+    fi
   fi
 
   if [[ -f /proc/sys/kernel/kptr_restrict ]]; then
     local kr; kr=$(cat /proc/sys/kernel/kptr_restrict 2>/dev/null || echo "?")
-    [[ "$kr" == "0" ]] && mod_warning "kptr_restrict: 0 — punteros del kernel expuestos en /proc"
+    if [[ "$kr" == "0" ]]; then
+      mod_warning "kptr_restrict: 0 — punteros del kernel expuestos en /proc"
+      add_finding "kernel_protection_weak" "warning" "kptr_restrict=0" \
+        "name=kptr_restrict" "value=0" "status=disabled"
+    fi
+  fi
+
+  # User namespaces sin restricción → habilita Dirty Pipe y otros exploits
+  if [[ -f /proc/sys/kernel/unprivileged_userns_clone ]]; then
+    local uns; uns=$(cat /proc/sys/kernel/unprivileged_userns_clone 2>/dev/null || echo "?")
+    add_finding "kernel_protection" "info" "unprivileged_userns_clone=$uns" \
+      "name=unprivileged_userns_clone" "value=$uns"
+    [[ "$uns" == "1" ]] && mod_warning "unprivileged_userns_clone=1 — habilita varios exploits de kernel"
   fi
 
   # ── Consulta CVEs a linuxkernelcves.com ───────────────────────────────────
@@ -580,6 +1071,9 @@ check_nfs() {
         mod_critical "NFS share con no_root_squash: $share"
         mod_critical "  Config: $line"
         print_verbose "Exploit: mount -t nfs TARGET:$share /mnt && cp /bin/bash /mnt/ && chmod +s /mnt/bash"
+        add_finding "nfs_no_root_squash" "critical" \
+          "NFS share con no_root_squash: $share" \
+          "share=$share" "config=$line"
       fi
 
       echo "$line" | grep -qi "no_all_squash" && \
@@ -747,13 +1241,22 @@ check_services() {
   fi
 
   if [[ -S /var/run/docker.sock ]]; then
-    [[ -r /var/run/docker.sock || -w /var/run/docker.sock ]] \
-      && mod_critical "Docker socket accesible — escalada a root posible vía contenedor" \
-      || mod_warning "Docker socket existe pero no accesible"
+    if [[ -r /var/run/docker.sock || -w /var/run/docker.sock ]]; then
+      mod_critical "Docker socket accesible — escalada a root posible vía contenedor"
+      add_finding "docker_socket_accessible" "critical" \
+        "Docker socket accesible — escalada a root posible vía contenedor" \
+        "path=/var/run/docker.sock"
+    else
+      mod_warning "Docker socket existe pero no accesible"
+    fi
   fi
 
-  id -nG | grep -q "\bdocker\b" && \
+  if id -nG | grep -q "\bdocker\b"; then
     mod_critical "Usuario en grupo 'docker' — escalada a root posible"
+    add_finding "user_in_docker_group" "critical" \
+      "Usuario en grupo 'docker' — escalada a root posible" \
+      "user=$(whoami)" "group=docker"
+  fi
 
   flush_module_json "Servicios"
 }
@@ -768,16 +1271,30 @@ check_env() {
   for dir in "${path_dirs[@]}"; do
     if [[ -d "$dir" && -w "$dir" ]]; then
       mod_critical "Directorio ESCRIBIBLE en PATH: $dir — PATH hijacking posible"
+      add_finding "path_writable" "critical" \
+        "Directorio ESCRIBIBLE en PATH: $dir — PATH hijacking posible" \
+        "directory=$dir"
     elif [[ "$dir" == "." || -z "$dir" ]]; then
       mod_critical "PATH incluye '.' — PATH hijacking posible"
+      add_finding "path_includes_cwd" "critical" \
+        "PATH incluye '.' o entrada vacía — PATH hijacking posible" \
+        "directory=${dir:-empty}"
     fi
   done
 
-  [[ -n "${LD_PRELOAD:-}" ]] \
-    && mod_critical "LD_PRELOAD activo: $LD_PRELOAD" \
-    || mod_ok "LD_PRELOAD no definido"
+  if [[ -n "${LD_PRELOAD:-}" ]]; then
+    mod_critical "LD_PRELOAD activo: $LD_PRELOAD"
+    add_finding "ld_preload_active" "critical" \
+      "LD_PRELOAD activo: $LD_PRELOAD" "value=$LD_PRELOAD"
+  else
+    mod_ok "LD_PRELOAD no definido"
+  fi
 
-  [[ -n "${LD_LIBRARY_PATH:-}" ]] && mod_warning "LD_LIBRARY_PATH definido: $LD_LIBRARY_PATH"
+  if [[ -n "${LD_LIBRARY_PATH:-}" ]]; then
+    mod_warning "LD_LIBRARY_PATH definido: $LD_LIBRARY_PATH"
+    add_finding "ld_library_path_set" "warning" \
+      "LD_LIBRARY_PATH definido: $LD_LIBRARY_PATH" "value=$LD_LIBRARY_PATH"
+  fi
 
   # Secrets en variables de entorno del proceso actual
   local env_secrets
@@ -791,6 +1308,9 @@ check_env() {
       varval=$(echo "$var" | cut -d= -f2-)
       # Mostrar solo primeros 4 chars del valor
       mod_critical "Secreto en entorno: ${varname}=${varval:0:4}[REDACTED]"
+      add_finding "env_secret" "critical" \
+        "Secreto en entorno: ${varname}=${varval:0:4}[REDACTED]" \
+        "var=$varname" "preview=${varval:0:4}"
     done <<< "$env_secrets"
   else
     mod_ok "No se detectaron secretos obvios en variables de entorno"
@@ -892,25 +1412,42 @@ check_containers() {
       if [[ -w "$sock" ]]; then
         mod_critical "Docker socket escribible: $sock — escape a root posible"
         print_verbose "Exploit: docker run -v /:/host --rm -it alpine chroot /host"
+        add_finding "docker_socket_writable" "critical" \
+          "Docker socket escribible: $sock — escape a root posible" \
+          "path=$sock"
       elif [[ -r "$sock" ]]; then
         mod_warning "Docker socket legible: $sock — enumeración de contenedores posible"
+        add_finding "docker_socket_readable" "warning" \
+          "Docker socket legible: $sock — enumeración de contenedores posible" \
+          "path=$sock"
       fi
     fi
   done
 
   # ── Docker en el grupo del usuario ────────────────────────────────────────
-  id -nG 2>/dev/null | grep -qw "docker" && \
+  if id -nG 2>/dev/null | grep -qw "docker"; then
     mod_critical "Usuario en grupo 'docker' — equivalente a root en el host"
+    add_finding "user_in_docker_group" "critical" \
+      "Usuario en grupo 'docker' — equivalente a root en el host" \
+      "user=$(whoami)" "group=docker"
+  fi
 
   # ── Montajes peligrosos desde el host ─────────────────────────────────────
   if [[ -f /proc/mounts || -r /proc/mounts ]]; then
     while IFS= read -r mnt; do
       mod_critical "Sistema de archivos del host montado: $mnt"
+      add_finding "host_filesystem_mounted" "critical" \
+        "Sistema de archivos del host montado: $mnt" \
+        "mount_line=$mnt"
     done < <(grep -E '^[^#].*\s/host' /proc/mounts 2>/dev/null || true)
 
     # /proc del host montado
-    grep -q "proc /proc/host" /proc/mounts 2>/dev/null && \
+    if grep -q "proc /proc/host" /proc/mounts 2>/dev/null; then
       mod_critical "/proc del host montado — acceso a procesos del host"
+      add_finding "host_proc_mounted" "critical" \
+        "/proc del host montado — acceso a procesos del host" \
+        "path=/proc/host"
+    fi
   fi
 
   # ── Kubernetes: service account tokens ────────────────────────────────────
@@ -919,7 +1456,12 @@ check_containers() {
     mod_critical "Token de Kubernetes ServiceAccount legible: $sa_token"
     print_verbose "Usar: kubectl --token=\$(cat $sa_token) auth can-i --list"
     local sa_ns="/var/run/secrets/kubernetes.io/serviceaccount/namespace"
-    [[ -f "$sa_ns" ]] && mod_info "Namespace K8s: $(cat "$sa_ns" 2>/dev/null)"
+    local namespace=""
+    [[ -f "$sa_ns" ]] && namespace=$(cat "$sa_ns" 2>/dev/null || echo "")
+    [[ -n "$namespace" ]] && mod_info "Namespace K8s: $namespace"
+    add_finding "k8s_serviceaccount_token" "critical" \
+      "Token de Kubernetes ServiceAccount legible: $sa_token" \
+      "path=$sa_token" "namespace=$namespace"
   fi
 
   # ── containerd / podman sockets ───────────────────────────────────────────
@@ -951,6 +1493,9 @@ check_cloud_imds() {
   aws_v1=$(curl $curl_opts "http://169.254.169.254/latest/meta-data/" 2>/dev/null || true)
   if [[ -n "$aws_v1" ]]; then
     mod_critical "AWS IMDSv1 accesible SIN token (inseguro) — metadatos expuestos"
+    add_finding "aws_imdsv1_open" "critical" \
+      "AWS IMDSv1 accesible SIN token (inseguro) — metadatos expuestos" \
+      "endpoint=169.254.169.254" "version=v1"
     # Intentar obtener credenciales del rol IAM
     local iam_role
     iam_role=$(curl $curl_opts \
@@ -963,6 +1508,9 @@ check_cloud_imds() {
       if echo "$creds" | grep -q "AccessKeyId" 2>/dev/null; then
         mod_critical "Credenciales AWS IAM accesibles vía IMDS para rol: $iam_role"
         print_verbose "Credenciales temporales de AWS expuestas — pueden usarse para movimiento lateral"
+        add_finding "aws_iam_credentials_exposed" "critical" \
+          "Credenciales AWS IAM accesibles vía IMDS para rol: $iam_role" \
+          "role=$iam_role" "cloud=aws"
       fi
     else
       mod_warning "AWS IMDSv1 accesible pero sin rol IAM configurado"
@@ -981,6 +1529,9 @@ check_cloud_imds() {
   if [[ -n "$aws_token" && -z "$aws_v1" ]]; then
     mod_warning "AWS IMDSv2 activo (requiere token PUT) — más seguro que v1"
     mod_info "Para revisar manualmente: curl -H 'X-aws-ec2-metadata-token: \$TOKEN' http://169.254.169.254/latest/meta-data/"
+    add_finding "aws_imdsv2_active" "warning" \
+      "AWS IMDSv2 activo (más seguro que v1)" \
+      "endpoint=169.254.169.254" "version=v2"
   fi
 
   [[ -z "$aws_v1" && -z "$aws_token" ]] && mod_ok "AWS IMDS no accesible"
@@ -993,6 +1544,9 @@ check_cloud_imds() {
     "http://metadata.google.internal/computeMetadata/v1/instance/" 2>/dev/null || true)
   if [[ -n "$gcp_meta" ]]; then
     mod_critical "GCP Metadata Server accesible — instancia en Google Cloud"
+    add_finding "gcp_metadata_accessible" "critical" \
+      "GCP Metadata Server accesible — instancia en Google Cloud" \
+      "endpoint=metadata.google.internal" "cloud=gcp"
     local gcp_token
     gcp_token=$(curl $curl_opts \
       -H "Metadata-Flavor: Google" \
@@ -1001,6 +1555,9 @@ check_cloud_imds() {
     if echo "$gcp_token" | grep -q "access_token" 2>/dev/null; then
       mod_critical "Token de servicio GCP accesible — credenciales de cuenta de servicio expuestas"
       print_verbose "Token puede usarse contra la API de Google Cloud"
+      add_finding "gcp_service_token_exposed" "critical" \
+        "Token de servicio GCP accesible — credenciales de cuenta de servicio expuestas" \
+        "cloud=gcp"
     fi
     local gcp_email
     gcp_email=$(curl $curl_opts \
@@ -1020,6 +1577,9 @@ check_cloud_imds() {
     "http://169.254.169.254/metadata/instance?api-version=2021-02-01" 2>/dev/null || true)
   if [[ -n "$azure_meta" ]] && echo "$azure_meta" | grep -q "subscriptionId" 2>/dev/null; then
     mod_critical "Azure IMDS accesible — instancia en Microsoft Azure"
+    add_finding "azure_imds_accessible" "critical" \
+      "Azure IMDS accesible — instancia en Microsoft Azure" \
+      "endpoint=169.254.169.254" "cloud=azure"
     local az_token
     az_token=$(curl $curl_opts \
       -H "Metadata: true" \
@@ -1028,6 +1588,9 @@ check_cloud_imds() {
     if echo "$az_token" | grep -q "access_token" 2>/dev/null; then
       mod_critical "Token Managed Identity de Azure accesible — credenciales expuestas"
       print_verbose "Token puede usarse contra la API de Azure Resource Manager"
+      add_finding "azure_managed_identity_token" "critical" \
+        "Token Managed Identity de Azure accesible — credenciales expuestas" \
+        "cloud=azure"
     fi
   else
     mod_ok "Azure IMDS no accesible"
@@ -1144,6 +1707,7 @@ check_systemd() {
     local pkexec_ver
     pkexec_ver=$(pkexec --version 2>/dev/null | grep -oP '[\d.]+' | head -1 || echo "?")
     mod_info "pkexec versión: $pkexec_ver"
+    add_finding "pkexec_version" "info" "pkexec versión: $pkexec_ver" "version=$pkexec_ver"
     # PwnKit afecta versiones < 0.120
     if [[ "$pkexec_ver" != "?" ]]; then
       local major minor
@@ -1152,6 +1716,9 @@ check_systemd() {
       if [[ "$major" -eq 0 && "${minor:-0}" -lt 120 ]] 2>/dev/null; then
         mod_critical "pkexec < 0.120 — potencialmente vulnerable a CVE-2021-4034 (PwnKit)"
         print_verbose "https://blog.qualys.com/vulnerabilities-threat-research/2022/01/25/pwnkit"
+        add_finding "cve_pwnkit" "critical" \
+          "pkexec $pkexec_ver < 0.120 — vulnerable a CVE-2021-4034 (PwnKit)" \
+          "cve=CVE-2021-4034" "version=$pkexec_ver" "fixed_in=0.120"
       else
         mod_ok "pkexec versión $pkexec_ver (no vulnerable a PwnKit)"
       fi
@@ -1312,6 +1879,314 @@ check_pam_and_ssh_keys() {
 }
 
 
+# ─── 17. Procesos, sockets unix y configs de shell ───────────────────────────
+# Vectores que un pentester revisa siempre:
+#   - Procesos root con binarios o configs en directorios escribibles
+#   - Tokens y secretos en /proc/*/environ y /proc/*/cmdline
+#   - Sockets unix con permisos relajados (Redis, MySQL, daemon custom...)
+#   - Configs de shell hijackeables (.bashrc/.zshrc/profile.d ajenos)
+
+# Helper: ¿este path pertenece a un paquete del sistema?
+# Si sí, lo consideramos "estándar" y no escribible normalmente.
+# Devuelve 0 si pertenece a un paquete, 1 si no o si no podemos determinar.
+_path_in_system_package() {
+  local path="$1"
+  [[ -z "$path" || ! -e "$path" ]] && return 1
+  # Debian/Ubuntu
+  if command -v dpkg &>/dev/null; then
+    dpkg -S "$path" &>/dev/null && return 0
+  fi
+  # RHEL/Fedora/CentOS
+  if command -v rpm &>/dev/null; then
+    rpm -qf "$path" &>/dev/null && return 0
+  fi
+  # Arch
+  if command -v pacman &>/dev/null; then
+    pacman -Qo "$path" &>/dev/null && return 0
+  fi
+  return 1
+}
+
+# Helper: ¿es un binario/path "interesante" (no estándar)?
+# Filtra paths típicos de paquetes del SO.
+_path_is_suspicious() {
+  local path="$1"
+  [[ -z "$path" ]] && return 1
+  # Paths obvios de paquetes — ni los chequeamos contra el package manager
+  case "$path" in
+    /usr/lib/*|/usr/libexec/*|/lib/*|/lib64/*) return 1 ;;
+    /usr/bin/*|/usr/sbin/*|/bin/*|/sbin/*)
+      # Solo confiamos si el package manager lo confirma
+      _path_in_system_package "$path" && return 1
+      return 0
+      ;;
+  esac
+  # /opt, /home, /tmp, /var/lib/<custom>, /usr/local/* — interesantes
+  return 0
+}
+
+check_processes() {
+  print_header "17. PROCESOS, SOCKETS UNIX Y CONFIGS DE SHELL"
+  _MOD_FINDINGS=(); _MOD_WARNINGS=(); _MOD_INFOS=()
+
+  local current_user; current_user=$(whoami)
+  local current_uid; current_uid=$(id -u)
+
+  # ── Procesos corriendo como root ──────────────────────────────────────────
+  mod_info "Enumerando procesos como root..."
+
+  # PIDs a ignorar: nuestro propio shell, su padre, y los hijos directos de awk/sed/grep
+  # del pipe `ps | awk` que enumera. Calculamos el árbol del propio script.
+  local self_pid="$$"
+  local parent_pid; parent_pid=$(awk '/PPid:/ {print $2}' /proc/$$/status 2>/dev/null || echo "")
+  local ignore_pids=" $self_pid $parent_pid "
+
+  # Listamos PID y COMMAND completo — usamos -e -o para evitar truncado
+  # Filtramos kthreadd y kernel threads (PPID 2 o brackets en cmd)
+  local root_procs_tmp
+  root_procs_tmp=$(_tmp_file)
+  ps -eo pid,user,cmd 2>/dev/null \
+    | awk '$2 == "root" && $3 !~ /^\[/ {pid=$1; $1=""; $2=""; print pid"|"$0}' \
+    | sed 's/| */|/' > "$root_procs_tmp"
+
+  local total_root_procs interesting_count=0
+  total_root_procs=$(wc -l < "$root_procs_tmp" 2>/dev/null || echo 0)
+  mod_info "Total procesos root: $total_root_procs (filtrando kthreads)"
+
+  # Para cada proceso root, extraer el binario y chequear si es "interesante"
+  local checked=0 max_check=200  # safety cap
+  while IFS='|' read -r pid cmd; do
+    [[ -z "$pid" || -z "$cmd" ]] && continue
+    [[ $checked -ge $max_check ]] && break
+    checked=$((checked + 1))
+
+    # Ignorar nuestro árbol (script + parent + cualquier helper transitorio)
+    [[ "$ignore_pids" == *" $pid "* ]] && continue
+    # El proceso puede haber terminado entre ps y ahora
+    [[ -e "/proc/$pid" ]] || continue
+    # Si su PPid es nuestro PID, también lo ignoramos (es un hijo nuestro: awk/sed/etc.)
+    local proc_ppid
+    proc_ppid=$(awk '/PPid:/ {print $2}' "/proc/$pid/status" 2>/dev/null || echo "")
+    [[ "$proc_ppid" == "$self_pid" ]] && continue
+
+    # Resolver el binario real del proceso vía /proc/<pid>/exe (más fiable que parsear cmd)
+    local exe_path=""
+    if [[ -L "/proc/$pid/exe" ]]; then
+      exe_path=$(readlink "/proc/$pid/exe" 2>/dev/null || echo "")
+    fi
+    # Si tiene " (deleted)" lo quitamos
+    exe_path="${exe_path% (deleted)}"
+
+    # Solo seguimos si tenemos un path absoluto. Si no, el proceso no es analizable
+    # (kernel thread, exec efímero, o cmd parcial). Lo ignoramos en silencio.
+    [[ "$exe_path" == /* ]] || continue
+
+    # Filtro: solo seguimos analizando si el path es "sospechoso"
+    _path_is_suspicious "$exe_path" || continue
+    interesting_count=$((interesting_count + 1))
+
+    local exe_perms exe_owner cwd
+    exe_perms=$(stat -c '%a' "$exe_path" 2>/dev/null || echo "?")
+    exe_owner=$(stat -c '%U' "$exe_path" 2>/dev/null || echo "?")
+    cwd=$(readlink "/proc/$pid/cwd" 2>/dev/null || echo "?")
+
+    mod_info "Proceso root no estándar: PID=$pid exe=$exe_path"
+
+    # Binario escribible por el usuario actual = escalada inmediata
+    if [[ -w "$exe_path" ]]; then
+      mod_critical "Binario de proceso root ESCRIBIBLE: $exe_path (PID=$pid)"
+      add_finding "process_root_writable_binary" "critical" \
+        "Binario de proceso root ESCRIBIBLE: $exe_path (PID=$pid)" \
+        "pid=$pid" "path=$exe_path" "owner=$exe_owner" "perms=$exe_perms" \
+        "cmd=${cmd:0:120}"
+      print_verbose "Reemplazar el binario y esperar reinicio del servicio = root"
+    fi
+
+    # Directorio del binario escribible = posible plant de librerías o swap del binario
+    local exe_dir
+    exe_dir=$(dirname "$exe_path" 2>/dev/null || echo "")
+    if [[ -n "$exe_dir" && -w "$exe_dir" ]]; then
+      mod_critical "Directorio del binario root ESCRIBIBLE: $exe_dir (PID=$pid)"
+      add_finding "process_root_writable_dir" "critical" \
+        "Directorio del binario root ESCRIBIBLE: $exe_dir (PID=$pid)" \
+        "pid=$pid" "directory=$exe_dir" "binary=$exe_path"
+    fi
+
+    # CWD escribible: si el proceso hace dlopen relativo o lee archivos relativos,
+    # podemos plantar contenido malicioso ahí
+    if [[ "$cwd" != "?" && -w "$cwd" ]]; then
+      mod_warning "CWD del proceso root ESCRIBIBLE: $cwd (PID=$pid, exe=$exe_path)"
+      add_finding "process_root_writable_cwd" "warning" \
+        "CWD del proceso root ESCRIBIBLE: $cwd (PID=$pid)" \
+        "pid=$pid" "cwd=$cwd" "binary=$exe_path"
+    fi
+  done < "$root_procs_tmp"
+
+  mod_info "Procesos root interesantes (no en paquetes del sistema): $interesting_count"
+
+  # ── Tokens y secretos en /proc/*/environ y /proc/*/cmdline ────────────────
+  mod_info "Buscando secretos en /proc/*/environ y /proc/*/cmdline (procesos ajenos)..."
+
+  local env_hits=0 cmd_hits=0
+  # Patrones (grep -i): nombres de variables / argumentos típicos
+  local secret_pattern='(PASSWORD|PASSWD|SECRET|TOKEN|API_KEY|APIKEY|PRIVATE_KEY|AWS_SECRET|DB_PASS|MYSQL_PWD|PGPASSWORD|GITHUB_TOKEN|GITLAB_TOKEN|SLACK_TOKEN|CREDENTIAL)='
+  local cmd_secret_pattern='(-p[^[:space:]]+|--password=|sshpass|MYSQL_PWD=|PGPASSWORD=)'
+
+  for proc_dir in /proc/[0-9]*; do
+    [[ -d "$proc_dir" ]] || continue
+    local pid; pid=$(basename "$proc_dir")
+    # Evitar procesos del propio usuario (lo que vemos con env ya está cubierto)
+    local proc_uid
+    proc_uid=$(stat -c '%u' "$proc_dir" 2>/dev/null || echo "?")
+    [[ "$proc_uid" == "$current_uid" ]] && continue
+
+    # /proc/<pid>/environ — separado por NUL
+    if [[ -r "$proc_dir/environ" ]]; then
+      local env_owner; env_owner=$(stat -c '%U' "$proc_dir/environ" 2>/dev/null || echo "?")
+      while IFS= read -r line; do
+        [[ -z "$line" ]] && continue
+        local varname varval
+        varname="${line%%=*}"
+        varval="${line#*=}"
+        mod_critical "Secreto en /proc/$pid/environ (owner=$env_owner): ${varname}=${varval:0:4}[REDACTED]"
+        add_finding "process_env_secret" "critical" \
+          "Secreto en /proc/$pid/environ (owner=$env_owner): ${varname}=${varval:0:4}[REDACTED]" \
+          "pid=$pid" "owner=$env_owner" "var=$varname" "preview=${varval:0:4}"
+        env_hits=$((env_hits + 1))
+      done < <(tr '\0' '\n' < "$proc_dir/environ" 2>/dev/null \
+                | grep -iE "^${secret_pattern}" | head -5 || true)
+    fi
+
+    # /proc/<pid>/cmdline — passwords como argumentos
+    if [[ -r "$proc_dir/cmdline" ]]; then
+      local cmdline
+      cmdline=$(tr '\0' ' ' < "$proc_dir/cmdline" 2>/dev/null | head -c 500 || echo "")
+      [[ -z "$cmdline" ]] && continue
+
+      if echo "$cmdline" | grep -qiE "$cmd_secret_pattern" 2>/dev/null; then
+        local cmd_owner; cmd_owner=$(stat -c '%U' "$proc_dir/cmdline" 2>/dev/null || echo "?")
+        # Redactar el match preservando solo primeros 3 chars del valor
+        local redacted
+        redacted=$(echo "$cmdline" | sed -E \
+          's/(-p|--password=|MYSQL_PWD=|PGPASSWORD=)([^[:space:]]{1,3})[^[:space:]]*/\1\2[REDACTED]/g')
+        mod_critical "Password en /proc/$pid/cmdline (owner=$cmd_owner): ${redacted:0:120}"
+        add_finding "process_cmdline_secret" "critical" \
+          "Password en /proc/$pid/cmdline (owner=$cmd_owner): ${redacted:0:120}" \
+          "pid=$pid" "owner=$cmd_owner" "preview=${redacted:0:120}"
+        cmd_hits=$((cmd_hits + 1))
+      fi
+    fi
+  done
+
+  if [[ $env_hits -eq 0 ]]; then
+    mod_ok "No se encontraron secretos en /proc/*/environ accesibles"
+  else
+    mod_info "Total secretos en environ: $env_hits"
+  fi
+
+  if [[ $cmd_hits -eq 0 ]]; then
+    mod_ok "No se encontraron passwords en /proc/*/cmdline accesibles"
+  else
+    mod_info "Total passwords en cmdline: $cmd_hits"
+  fi
+
+  # ── Sockets unix con permisos relajados ───────────────────────────────────
+  mod_info "Revisando sockets unix..."
+
+  # Sockets de daemons del sistema esperados con permisos típicos relajados — los marcamos como info
+  local socket_checked=0 socket_hits=0
+  for sock_path in $(find /var/run /run /tmp -maxdepth 4 -type s 2>/dev/null | head -100); do
+    [[ -S "$sock_path" ]] || continue
+    socket_checked=$((socket_checked + 1))
+    local sock_perms sock_owner sock_group
+    sock_perms=$(stat -c '%a' "$sock_path" 2>/dev/null || echo "?")
+    sock_owner=$(stat -c '%U' "$sock_path" 2>/dev/null || echo "?")
+    sock_group=$(stat -c '%G' "$sock_path" 2>/dev/null || echo "?")
+
+    # Skip ciertos sockets esperados (systemd internals con perms estándar)
+    case "$sock_path" in
+      /run/systemd/notify|/run/systemd/journal/*|/run/systemd/private*|/run/systemd/io.system.ManagedOOM)
+        continue ;;
+    esac
+
+    # Detectar permisos relajados
+    # World-writable (cualquier "?" en último dígito = otros) o group-writable a grupos amplios
+    local world_writable=false world_readable=false
+    case "${sock_perms: -1}" in
+      2|3|6|7) world_writable=true ;;
+      4|5)     world_readable=true ;;
+    esac
+
+    if [[ -w "$sock_path" && "$sock_owner" != "$current_user" ]]; then
+      socket_hits=$((socket_hits + 1))
+      # ¿de qué daemon es? buscar el proceso que lo abrió (lsof si está)
+      local sock_proc=""
+      if command -v lsof &>/dev/null; then
+        sock_proc=$(lsof -t "$sock_path" 2>/dev/null | head -1 || echo "")
+      fi
+      mod_critical "Socket unix ESCRIBIBLE por nuestro user: $sock_path (owner=$sock_owner:$sock_group perms=$sock_perms)"
+      add_finding "unix_socket_writable" "critical" \
+        "Socket unix ESCRIBIBLE: $sock_path (owner=$sock_owner:$sock_group)" \
+        "path=$sock_path" "owner=$sock_owner" "group=$sock_group" \
+        "perms=$sock_perms" "pid=${sock_proc:-unknown}"
+    elif $world_writable; then
+      socket_hits=$((socket_hits + 1))
+      mod_critical "Socket unix WORLD-WRITABLE: $sock_path (perms=$sock_perms, owner=$sock_owner)"
+      add_finding "unix_socket_writable" "critical" \
+        "Socket unix WORLD-WRITABLE: $sock_path (owner=$sock_owner, perms=$sock_perms)" \
+        "path=$sock_path" "owner=$sock_owner" "perms=$sock_perms"
+    elif $world_readable && [[ "$sock_owner" == "root" ]]; then
+      mod_warning "Socket unix de root WORLD-READABLE: $sock_path (perms=$sock_perms)"
+      add_finding "unix_socket_readable" "warning" \
+        "Socket unix de root WORLD-READABLE: $sock_path (perms=$sock_perms)" \
+        "path=$sock_path" "owner=$sock_owner" "perms=$sock_perms"
+    fi
+  done
+
+  mod_info "Sockets unix revisados: $socket_checked, con permisos relajados: $socket_hits"
+
+  # ── Configs de shell hijackeables ─────────────────────────────────────────
+  mod_info "Revisando configs de shell de otros usuarios..."
+
+  # /etc/profile.d/* — se ejecuta para todo login interactivo
+  if [[ -d /etc/profile.d ]]; then
+    while IFS= read -r f; do
+      [[ -n "$f" ]] || continue
+      mod_critical "Script de /etc/profile.d ESCRIBIBLE: $f"
+      add_finding "profile_d_writable" "critical" \
+        "Script de /etc/profile.d ESCRIBIBLE: $f — escalada al próximo login de cualquier usuario" \
+        "path=$f"
+    done < <(find /etc/profile.d -maxdepth 1 -type f -writable 2>/dev/null || true)
+  fi
+
+  # /etc/profile, /etc/bashrc, /etc/bash.bashrc, /etc/zsh/zshrc — globales
+  for f in /etc/profile /etc/bashrc /etc/bash.bashrc /etc/zsh/zshrc /etc/zshrc; do
+    [[ -f "$f" && -w "$f" ]] || continue
+    mod_critical "Config global de shell ESCRIBIBLE: $f"
+    add_finding "shell_rc_writable" "critical" \
+      "Config global de shell ESCRIBIBLE: $f — escalada al próximo login" \
+      "path=$f" "scope=global"
+  done
+
+  # .bashrc / .zshrc / .profile de OTROS usuarios (incluyendo root)
+  for home_dir in /root /home/*; do
+    [[ -d "$home_dir" ]] || continue
+    local home_owner; home_owner=$(stat -c '%U' "$home_dir" 2>/dev/null || echo "?")
+    [[ "$home_owner" == "$current_user" ]] && continue
+    for rc_name in .bashrc .zshrc .profile .bash_profile .bash_login .bash_logout .zshenv .zlogin; do
+      local rc="$home_dir/$rc_name"
+      [[ -f "$rc" && -w "$rc" ]] || continue
+      mod_critical "Config de shell de OTRO usuario ESCRIBIBLE: $rc (owner=$home_owner)"
+      add_finding "shell_rc_writable" "critical" \
+        "Config de shell de OTRO usuario ESCRIBIBLE: $rc (owner=$home_owner)" \
+        "path=$rc" "owner=$home_owner" "scope=user"
+    done
+  done
+
+  flush_module_json "Procesos y shell"
+}
+
+
 
 # ─── Resumen final ────────────────────────────────────────────────────────────
 print_summary() {
@@ -1355,11 +2230,20 @@ export_json() {
     first=false
   done
 
+  # Findings estructurados (vista plana, todos los módulos juntos)
+  local findings_str="" first_f=true
+  for f in "${STRUCTURED_FINDINGS[@]+"${STRUCTURED_FINDINGS[@]}"}"; do
+    $first_f || findings_str+=","
+    findings_str+="$f"
+    first_f=false
+  done
+
   cat > "$json_path" <<EOF
 {
   "report": {
     "tool": "roothunter.sh",
-    "version": "1.1.0",
+    "version": "1.2.0",
+    "schema_version": "2",
     "timestamp": "$TIMESTAMP_ISO",
     "script_sha256": "$SCRIPT_SHA256",
     "target": {
@@ -1373,8 +2257,12 @@ export_json() {
     "summary": {
       "critical": ${#FINDINGS[@]},
       "warnings": ${#WARNINGS[@]},
-      "info": ${#INFOS[@]}
+      "info": ${#INFOS[@]},
+      "structured_findings": ${#STRUCTURED_FINDINGS[@]}
     },
+    "findings": [
+      $findings_str
+    ],
     "modules": [
       $modules_str
     ]
@@ -1404,7 +2292,7 @@ main() {
   echo "  ██║  ██║╚██████╔╝╚██████╔╝   ██║   ██║  ██║╚██████╔╝██║ ╚████║   ██║   ███████╗██║  ██║"
   echo "  ╚═╝  ╚═╝ ╚═════╝  ╚═════╝    ╚═╝   ╚═╝  ╚═╝ ╚═════╝ ╚═╝  ╚═══╝   ╚═╝   ╚══════╝╚═╝  ╚═╝"
   echo -e "${RESET}"
-  echo -e "${BOLD}  Script de Auditoría de Seguridad Linux v1.1.0${RESET}"
+  echo -e "${BOLD}  Script de Auditoría de Seguridad Linux v1.2.0${RESET}"
   echo -e "  ${YELLOW}⚠  Usar solo en sistemas con autorización explícita${RESET}"
   [[ -n "$SELECTED_MODULES" ]] && \
     echo -e "  ${CYAN}Módulos seleccionados: $SELECTED_MODULES${RESET}"
@@ -1428,11 +2316,12 @@ main() {
     [cloud]="check_cloud_imds:Cloud IMDS:30"
     [systemd]="check_systemd:Systemd:30"
     [pam]="check_pam_and_ssh_keys:PAM y SSH keys:20"
+    [processes]="check_processes:Procesos y shell:60"
   )
 
   local MODULE_ORDER=(
     sysinfo suid sudo cron files caps kernel nfs
-    history services env users containers cloud systemd pam
+    history services env users containers cloud systemd pam processes
   )
 
   # Ejecutar módulos
