@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # =============================================================================
-#  roothunter.sh — Script de Auditoría de Seguridad Linux v1.2.0
+#  roothunter.sh — Script de Auditoría de Seguridad Linux v1.2.1
 #  Detecta vectores comunes de escalada de privilegios
 #  Autor: Matias López | Portafolio: github.com/Matic539
 #
@@ -232,7 +232,10 @@ _GTFOBINS_PATH=""
 _init_gtfobins_path() {
   local script_dir
   script_dir=$(dirname "$(readlink -f "$0" 2>/dev/null || echo "$0")")
-  if [[ -f "$script_dir/gtfobins.py" ]]; then
+  if [[ -f "$script_dir/lib/gtfobins.py" ]]; then
+    _GTFOBINS_PATH="$script_dir/lib/gtfobins.py"
+  elif [[ -f "$script_dir/gtfobins.py" ]]; then
+    # Fallback compat: gtfobins.py al lado del script (estructura antigua)
     _GTFOBINS_PATH="$script_dir/gtfobins.py"
   fi
 }
@@ -2242,7 +2245,7 @@ export_json() {
 {
   "report": {
     "tool": "roothunter.sh",
-    "version": "1.2.0",
+    "version": "1.2.1",
     "schema_version": "2",
     "timestamp": "$TIMESTAMP_ISO",
     "script_sha256": "$SCRIPT_SHA256",
@@ -2292,7 +2295,7 @@ main() {
   echo "  ██║  ██║╚██████╔╝╚██████╔╝   ██║   ██║  ██║╚██████╔╝██║ ╚████║   ██║   ███████╗██║  ██║"
   echo "  ╚═╝  ╚═╝ ╚═════╝  ╚═════╝    ╚═╝   ╚═╝  ╚═╝ ╚═════╝ ╚═╝  ╚═══╝   ╚═╝   ╚══════╝╚═╝  ╚═╝"
   echo -e "${RESET}"
-  echo -e "${BOLD}  Script de Auditoría de Seguridad Linux v1.2.0${RESET}"
+  echo -e "${BOLD}  Script de Auditoría de Seguridad Linux v1.2.1${RESET}"
   echo -e "  ${YELLOW}⚠  Usar solo en sistemas con autorización explícita${RESET}"
   [[ -n "$SELECTED_MODULES" ]] && \
     echo -e "  ${CYAN}Módulos seleccionados: $SELECTED_MODULES${RESET}"
