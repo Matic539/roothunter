@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # =============================================================================
-#  rh-analyze — Analizador de reportes RootHunter v1.2
+#  rh-analyze — Analizador de reportes RootHunter v1.2.1
 #  Lee reportes JSON generados por roothunter.sh
 #  análisis: sugerencias de exploits, attack paths, scoring, diff.
 #
@@ -240,9 +240,9 @@ class Report:
 def _finding_from_dict(d: dict, module: str = '?') -> Finding:
     """Construye un Finding desde un objeto del array 'findings' (schema v2)."""
     sev = d.get('severity', 'info')
-    # Normalizar variantes ('warnings' -> 'warning')
-    if sev.endswith('s') and sev != 'critical':
-        sev = sev.rstrip('s')
+    # Normalizar variantes plurales a singular ('warnings' → 'warning').
+    # Mapping explícito: más claro y robusto que heurística por sufijo 's'.
+    sev = _SEVERITY_NORMALIZE.get(sev, sev)
     return Finding(
         severity=sev,
         module=module,
@@ -250,6 +250,13 @@ def _finding_from_dict(d: dict, module: str = '?') -> Finding:
         type=d.get('type', 'unknown'),
         data=d.get('data', {}) or {},
     )
+
+
+_SEVERITY_NORMALIZE = {
+    'warnings': 'warning',
+    'criticals': 'critical',
+    'infos': 'info',
+}
 
 
 # ─── Comparador de versiones ──────────────────────────────────────────────────
@@ -1112,22 +1119,13 @@ def collect_techniques(r: Report) -> list[dict]:
         cap_name = f.data.get('capability', '')
         bin_path = f.data.get('path', '')
         bin_name = f.data.get('binary', '')
-        cap_info = gtfobins.lookup_capability(cap_name) if cap_name else None
-        if cap_info is None:
+        if not cap_name or not bin_name:
             continue
-        exploits_for_cap = cap_info.get('exploits', {})
-        # Buscar técnica con matching inteligente: exacto > simplificado > prefijo
-        tech = exploits_for_cap.get(bin_name)
-        if tech is None:
-            simplified = re.sub(r'[\d.]+$', '', bin_name)
-            if simplified and simplified != bin_name:
-                tech = exploits_for_cap.get(simplified)
-        if tech is None:
-            base = re.match(r'^([a-z]+)', bin_name)
-            if base:
-                tech = exploits_for_cap.get(base.group(1))
+        # Matching inteligente centralizado en gtfobins (exacto > simplificado > prefijo)
+        tech = gtfobins.lookup_capability_for_binary(cap_name, bin_name)
         if tech is None:
             continue
+        cap_info = gtfobins.lookup_capability(cap_name) or {}
         rel, stl, spd = gtfobins.get_scoring(tech, 'capability')
         score, tier = gtfobins.score_technique(rel, stl, spd)
         out.append({

@@ -1392,6 +1392,9 @@ CAPABILITIES = {
 
 # ─── API pública ──────────────────────────────────────────────────────────────
 
+import re as _re
+
+
 def lookup_suid(binary: str) -> dict | None:
     """Busca técnica SUID por nombre de binario. Devuelve dict o None."""
     return SUID.get(binary)
@@ -1405,6 +1408,45 @@ def lookup_sudo(binary: str) -> dict | None:
 def lookup_capability(cap: str) -> dict | None:
     """Busca info y exploits de una capability dada."""
     return CAPABILITIES.get(cap.lower())
+
+
+def lookup_capability_for_binary(cap: str, binary: str) -> dict | None:
+    """Busca técnica de explotación para una capability+binario con fallback.
+
+    Centraliza el matching inteligente que antes vivía en rh-analyze:
+        1. exacto         (python3.10)
+        2. simplificado   (python3.10 → python3 → python)
+        3. prefijo alfa   (perl5.36 → perl)
+
+    Devuelve la técnica concreta (dict con verify/exploit/...) o None.
+    Reutilizable desde rh-analyze y desde el wrapper de verificación de
+    roothunter.sh — evita reimplementar la lógica en dos sitios.
+    """
+    cap_info = lookup_capability(cap)
+    if cap_info is None:
+        return None
+    exploits = cap_info.get('exploits', {})
+
+    # 1) exacto
+    tech = exploits.get(binary)
+    if tech is not None:
+        return tech
+
+    # 2) simplificado: stripear sufijo numérico/punto (python3.10 → python)
+    simplified = _re.sub(r'[\d.]+$', '', binary)
+    if simplified and simplified != binary:
+        tech = exploits.get(simplified)
+        if tech is not None:
+            return tech
+
+    # 3) prefijo alfa puro (perl5.36 → perl)
+    m = _re.match(r'^([a-z]+)', binary)
+    if m:
+        tech = exploits.get(m.group(1))
+        if tech is not None:
+            return tech
+
+    return None
 
 
 def all_suid_binaries() -> list[str]:
@@ -1432,6 +1474,68 @@ def coverage_summary() -> dict:
             len(c.get('exploits', {})) for c in CAPABILITIES.values()
         ),
     }
+
+
+# ─── Validación de schema ─────────────────────────────────────────────────────
+# Se ejecuta una sola vez al importar el módulo. Falla rápido y con mensaje
+# claro si alguien edita el dict y rompe una entrada.
+#
+# Reglas:
+#   - SUID/SUDO: debe haber al menos 'exploit' Y (uno de 'verify' o 'verify_levels')
+#   - CAPABILITIES: cada cap debe tener 'exploits' dict; cada exploit, 'exploit'
+#
+# No validamos campos opcionales (notes, ref, why) — su ausencia degrada el
+# render pero no rompe la herramienta.
+
+class GtfobinsSchemaError(ValueError):
+    """Lanzada al import si una entrada de SUID/SUDO/CAPABILITIES está mal formada."""
+
+
+def _validate_schema() -> list[str]:
+    """Valida que las tablas estén bien formadas. Devuelve lista de errores.
+
+    Lista vacía → schema válido. Si no, el import falla con GtfobinsSchemaError.
+    """
+    errors: list[str] = []
+
+    for kind, table in (('SUID', SUID), ('SUDO', SUDO)):
+        for binary, tech in table.items():
+            if not isinstance(tech, dict):
+                errors.append(f"{kind}[{binary!r}] no es dict")
+                continue
+            if 'exploit' not in tech:
+                errors.append(f"{kind}[{binary!r}] falta 'exploit'")
+            if 'verify' not in tech and 'verify_levels' not in tech:
+                errors.append(
+                    f"{kind}[{binary!r}] falta 'verify' o 'verify_levels'")
+
+    for cap_name, cap_info in CAPABILITIES.items():
+        if not isinstance(cap_info, dict):
+            errors.append(f"CAPABILITIES[{cap_name!r}] no es dict")
+            continue
+        exploits = cap_info.get('exploits')
+        if not isinstance(exploits, dict):
+            errors.append(f"CAPABILITIES[{cap_name!r}] sin 'exploits' dict")
+            continue
+        for bin_name, tech in exploits.items():
+            if not isinstance(tech, dict):
+                errors.append(
+                    f"CAPABILITIES[{cap_name!r}][{bin_name!r}] no es dict")
+                continue
+            if 'exploit' not in tech:
+                errors.append(
+                    f"CAPABILITIES[{cap_name!r}][{bin_name!r}] falta 'exploit'")
+
+    return errors
+
+
+_SCHEMA_ERRORS = _validate_schema()
+if _SCHEMA_ERRORS:
+    # Mostramos hasta 5 errores para que sea diagnosticable sin spam
+    _msg = "gtfobins.py schema inválido:\n  " + "\n  ".join(_SCHEMA_ERRORS[:5])
+    if len(_SCHEMA_ERRORS) > 5:
+        _msg += f"\n  ... y {len(_SCHEMA_ERRORS) - 5} más"
+    raise GtfobinsSchemaError(_msg)
 
 
 if __name__ == '__main__':

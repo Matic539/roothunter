@@ -18,6 +18,8 @@
 #  solo porque el basename coincide.
 # =============================================================================
 
+from functools import lru_cache
+
 # ─── SUIDs comunes a todas las distros Linux ──────────────────────────────────
 # Estos paths existen en prácticamente cualquier instalación Linux estándar.
 # Son SUID porque la funcionalidad lo requiere (cambio de contraseña, mount,
@@ -45,6 +47,16 @@ COMMON = {
     '/usr/libexec/polkit-agent-helper-1':           'polkit agent helper (libexec)',
     '/usr/lib/openssh/ssh-keysign':                  'ssh-keysign: autenticación host-based',
     '/usr/libexec/openssh/ssh-keysign':              'ssh-keysign (variante)',
+    # Browsers con sandbox SUID (frecuente y típicamente correcto)
+    '/usr/lib/firefox/firefox':                      'firefox sandbox helper',
+    '/usr/lib/firefox-esr/firefox-esr':              'firefox-esr sandbox helper',
+    '/opt/google/chrome/chrome-sandbox':             'chrome sandbox helper',
+    '/opt/microsoft/msedge/msedge-sandbox':          'edge sandbox helper',
+    '/opt/brave.com/brave/chrome-sandbox':           'brave sandbox helper',
+    # Containerization helpers comunes
+    '/usr/bin/bwrap':                                'bubblewrap sandbox (flatpak)',
+    '/usr/bin/newuidmap':                            'newuidmap: rootless containers',
+    '/usr/bin/newgidmap':                            'newgidmap: rootless containers',
 }
 
 # ─── Específicos de Debian/Ubuntu ─────────────────────────────────────────────
@@ -93,17 +105,23 @@ ARCH = {
 
 # ─── Específicos de Alpine ────────────────────────────────────────────────────
 ALPINE = {
-    '/bin/busybox':           'busybox: SUID en algunas configuraciones de Alpine',
-    '/usr/bin/su-exec':       'su-exec: variante de su minimalista',
+    '/bin/busybox':                       'busybox: SUID en algunas configuraciones de Alpine',
+    '/usr/bin/su-exec':                   'su-exec: variante de su minimalista',
+    '/bin/bbsuid':                        'bbsuid: helper SUID para busybox',
+    '/sbin/apk':                          'apk: package manager (raramente SUID, pero visto)',
+    '/usr/lib/firefox/firefox':           'firefox sandbox (Alpine package)',
 }
 
 
 # ─── Heurística para identificar la familia de distro ─────────────────────────
+@lru_cache(maxsize=16)
 def detect_distro_family(os_name: str) -> str:
     """Devuelve una de: 'debian', 'rhel', 'arch', 'alpine', 'unknown'.
 
     Acepta strings tipo 'Ubuntu 22.04 LTS', 'Debian GNU/Linux 12 (bookworm)',
     'Rocky Linux 9.3', 'Arch Linux', 'Alpine Linux v3.19', etc.
+
+    Cacheado: durante un análisis el os_name no cambia.
     """
     if not os_name:
         return 'unknown'
@@ -122,7 +140,16 @@ def detect_distro_family(os_name: str) -> str:
 
 
 def _whitelist_for_family(family: str) -> dict:
-    """Construye el set efectivo: COMMON + específico de la familia."""
+    """Construye el set efectivo: COMMON + específico de la familia.
+
+    Cacheado: el dict resultante es inmutable y solo depende del 'family'.
+    En auditorías con docenas de SUIDs evitamos rebuildear en cada lookup.
+    """
+    return _build_whitelist(family)
+
+
+@lru_cache(maxsize=8)
+def _build_whitelist(family: str) -> dict:
     merged = dict(COMMON)
     if family == 'debian':
         merged.update(DEBIAN)

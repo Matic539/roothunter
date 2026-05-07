@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # =============================================================================
-#  roothunter.sh — Script de Auditoría de Seguridad Linux v1.2.1
+#  roothunter.sh — Script de Auditoría de Seguridad Linux v1.2.2
 #  Detecta vectores comunes de escalada de privilegios
 #  Autor: Matias López | Portafolio: github.com/Matic539
 #
@@ -46,6 +46,31 @@ JSON_MODULES=()
 # Se acumulan globalmente y también por módulo para mantener compatibilidad.
 STRUCTURED_FINDINGS=()
 _MOD_STRUCTURED=()
+
+# ─── Cache de identidad del usuario ───────────────────────────────────────────
+# Estos valores no cambian durante la ejecución. Cachearlos evita decenas de
+# forks de whoami/id en módulos que comparan owner de archivos.
+CURRENT_USER=$(whoami 2>/dev/null || echo "?")
+CURRENT_UID=$(id -u 2>/dev/null || echo "?")
+CURRENT_GID=$(id -g 2>/dev/null || echo "?")
+CURRENT_GROUPS=$(id -Gn 2>/dev/null || echo "?")
+
+# ─── Lookup O(1) de SUID peligrosos ───────────────────────────────────────────
+# Antes: loop O(n) por cada SUID detectado contra ~60 nombres → O(n*60) forks/comparaciones.
+# Ahora: hash de bash, O(1) por SUID. En sistemas con 50 SUIDs son ~3000 → 50.
+declare -gA DANGEROUS_SUID=(
+  [nmap]=1 [vim]=1 [vi]=1 [nano]=1 [find]=1 [bash]=1 [sh]=1 [dash]=1
+  [less]=1 [more]=1 [awk]=1 [gawk]=1 [python]=1 [python3]=1 [perl]=1
+  [ruby]=1 [lua]=1 [env]=1 [tee]=1 [cp]=1 [mv]=1 [chmod]=1 [chown]=1
+  [dd]=1 [tar]=1 [zip]=1 [unzip]=1 [curl]=1 [wget]=1 [nc]=1 [netcat]=1
+  [ncat]=1 [socat]=1 [tcpdump]=1 [strace]=1 [ltrace]=1 [gdb]=1 [node]=1
+  [php]=1 [man]=1 [ftp]=1 [tftp]=1 [ssh]=1 [scp]=1 [rsync]=1 [docker]=1
+  [lxc]=1 [runc]=1 [kubectl]=1 [git]=1 [make]=1 [gcc]=1 [mysql]=1
+  [sqlite3]=1 [psql]=1 [mongod]=1 [redis-cli]=1 [openssl]=1 [pkexec]=1
+  [su]=1 [sudo]=1 [passwd]=1 [snap]=1 [pip]=1 [pip3]=1 [irb]=1
+  [lua5.1]=1 [lua5.2]=1 [lua5.3]=1 [expect]=1 [ionice]=1 [nice]=1
+  [taskset]=1 [time]=1 [timeout]=1 [watch]=1
+)
 
 
 
@@ -102,6 +127,9 @@ usage() {
   echo -e "${BOLD}Ejemplos:${RESET}"
   echo "  bash $0 -m suid,sudo,kernel"
   echo "  bash $0 -o reporte.txt -j reporte.json -v"
+  echo ""
+  echo -e "${BOLD}Ejemplos recomendados:${RESET}"
+  echo "  bash $0 -V -j reporte.json"
   echo ""
   exit 0
 }
@@ -434,8 +462,8 @@ check_system_info() {
   mod_info "Kernel      : $(uname -r)"
   mod_info "Arquitectura: $(uname -m)"
   mod_info "Fecha audit : $TIMESTAMP"
-  mod_info "Usuario     : $(whoami) (UID=$(id -u), GID=$(id -g))"
-  mod_info "Grupos      : $(id -Gn)"
+  mod_info "Usuario     : $CURRENT_USER (UID=$CURRENT_UID, GID=$CURRENT_GID)"
+  mod_info "Grupos      : $CURRENT_GROUPS"
   mod_info "SHA256 script: $SCRIPT_SHA256"
 
   # Detectar versión de glibc — relevante para CVE-2023-4911 Looney Tunables
@@ -467,19 +495,6 @@ check_suid_sgid() {
   print_header "2. BINARIOS SUID / SGID"
   _MOD_FINDINGS=(); _MOD_WARNINGS=(); _MOD_INFOS=()
 
-  local dangerous_suid=(
-    "nmap" "vim" "vi" "nano" "find" "bash" "sh" "dash" "less" "more"
-    "awk" "gawk" "python" "python3" "perl" "ruby" "lua" "env" "tee"
-    "cp" "mv" "chmod" "chown" "dd" "tar" "zip" "unzip" "curl" "wget"
-    "nc" "netcat" "ncat" "socat" "tcpdump" "strace" "ltrace" "gdb"
-    "node" "php" "man" "ftp" "tftp" "ssh" "scp" "rsync"
-    "docker" "lxc" "runc" "kubectl" "git" "make" "gcc"
-    "mysql" "sqlite3" "psql" "mongod" "redis-cli"
-    "openssl" "pkexec" "su" "sudo" "passwd" "snap" "pip" "pip3"
-    "ruby" "irb" "lua" "lua5.1" "lua5.2" "lua5.3" "expect"
-    "ionice" "nice" "taskset" "time" "timeout" "watch"
-  )
-
   mod_info "Buscando binarios SUID en sistemas de archivos locales (-xdev)..."
   local count=0 sgid_count=0
 
@@ -491,15 +506,18 @@ check_suid_sgid() {
 
   while IFS= read -r bin; do
     [[ -z "$bin" ]] && continue
-    local name owner perms is_dangerous=false
-    name=$(basename "$bin" 2>/dev/null) || continue
-    owner=$(stat -c '%U' "$bin" 2>/dev/null || echo "?")
-    perms=$(stat -c '%a' "$bin" 2>/dev/null || echo "?")
+    local name owner perms
+    # basename inline (sin fork): expansión de parámetros
+    name="${bin##*/}"
+    # Una sola llamada a stat para owner+perms en vez de dos forks por SUID.
+    # Si stat falla, ambos quedan en "?" — el formato es estable.
+    IFS='|' read -r owner perms < <(stat -c '%U|%a' "$bin" 2>/dev/null || echo "?|?")
+    [[ -z "$owner" ]] && owner="?"
+    [[ -z "$perms" ]] && perms="?"
     count=$((count + 1))
-    for d in "${dangerous_suid[@]}"; do
-      [[ "$name" == "$d" ]] && is_dangerous=true && break
-    done
-    if $is_dangerous; then
+
+    # Lookup O(1) contra el set declarado globalmente
+    if [[ -n "${DANGEROUS_SUID[$name]:-}" ]]; then
       mod_critical "SUID peligroso: $bin (owner: $owner, perms: $perms)"
       print_verbose "GTFOBins: https://gtfobins.github.io/gtfobins/$name/"
       # Verificación opcional opt-in
@@ -511,8 +529,7 @@ check_suid_sgid() {
           [[ -n "$vline" ]] && verify_kv+=("$vline")
         done <<< "$vout"
         # Mostrar resultado en consola
-        local vstatus
-        vstatus=$(echo "$vout" | grep '^verified=' | cut -d= -f2)
+        local vstatus="${vout#*verified=}"; vstatus="${vstatus%%$'\n'*}"
         case "$vstatus" in
           true)    print_verbose "✓ Verificado: vector confirmado en gtfobins.py" ;;
           false)   print_verbose "✗ No verificado: chequeos no concluyentes" ;;
@@ -543,7 +560,7 @@ check_suid_sgid() {
     [[ -z "$bin" ]] && continue
     sgid_count=$((sgid_count + 1))
     local sgid_name sgid_owner_group
-    sgid_name=$(basename "$bin" 2>/dev/null) || sgid_name="?"
+    sgid_name="${bin##*/}"
     sgid_owner_group=$(stat -c '%U:%G' "$bin" 2>/dev/null || echo '?')
     mod_warning "SGID: $bin (owner: $sgid_owner_group)"
     add_finding "sgid_binary" "warning" \
@@ -593,7 +610,7 @@ _parse_sudo_line() {
     # Extraer path del binario (primera "palabra" del comando)
     local bin_path bin_name args has_wildcard="false"
     bin_path="${cmd_full%% *}"
-    bin_name=$(basename "$bin_path" 2>/dev/null || echo "$bin_path")
+    bin_name="${bin_path##*/}"  # basename inline (sin fork)
     args="${cmd_full#"$bin_path"}"
     args="${args#"${args%%[![:space:]]*}"}"
     [[ "$cmd_full" == *"*"* ]] && has_wildcard="true"
@@ -642,7 +659,7 @@ check_sudo() {
     mod_critical "El usuario puede ejecutar sudo SIN contraseña"
     add_finding "sudo_nopasswd_available" "critical" \
       "El usuario puede ejecutar sudo SIN contraseña" \
-      "user=$(whoami)"
+      "user=$CURRENT_USER"
     while IFS= read -r line; do
       [[ -z "$line" || "$line" =~ ^(Matching|User|Defaults) ]] && continue
       mod_critical "  → $line"
@@ -652,9 +669,13 @@ check_sudo() {
     mod_info "sudo requiere contraseña o no hay permisos configurados"
   fi
 
-  # Grupo privilegiado
-  local priv_groups
-  priv_groups=$(id -nG 2>/dev/null | tr ' ' '\n' | grep -E '^(sudo|wheel|admin)$' | tr '\n' ' ' | sed 's/ $//')
+  # Grupo privilegiado — usar el caché en vez de id -nG | tr | grep | tr | sed
+  local priv_groups=""
+  for g in $CURRENT_GROUPS; do
+    case "$g" in
+      sudo|wheel|admin) priv_groups+="${priv_groups:+ }$g" ;;
+    esac
+  done
   if [[ -n "$priv_groups" ]]; then
     mod_warning "Grupo privilegiado: $priv_groups"
     add_finding "privileged_group_membership" "warning" \
@@ -774,7 +795,7 @@ check_file_permissions() {
       if [[ -f "$key" && -r "$key" ]]; then
         mod_critical "Clave SSH privada legible: $key"
         local key_owner; key_owner=$(stat -c '%U' "$key" 2>/dev/null || echo '?')
-        local key_type; key_type=$(basename "$key")
+        local key_type="${key##*/}"  # basename inline
         add_finding "ssh_private_key_readable" "critical" \
           "Clave SSH privada legible: $key" \
           "path=$key" "owner=$key_owner" "key_type=$key_type"
@@ -840,11 +861,13 @@ check_capabilities() {
       caps_field="${caps_field#= }"
       # Solo la parte antes del flag (+ep, +ei, etc.)
       local caps_only="${caps_field%%+*}"
-      bin_name=$(basename "$bin_path" 2>/dev/null || echo "$bin_path")
+      bin_name="${bin_path##*/}"  # basename inline (sin fork)
 
+      # Lowercase para matching robusto contra dangerous_caps (que están en lowercase)
+      local caps_only_lc="${caps_only,,}"
       local is_dangerous=false matched_cap=""
       for dc in "${dangerous_caps[@]}"; do
-        if echo "$caps_only" | grep -qi "$dc" 2>/dev/null; then
+        if [[ "$caps_only_lc" == *"$dc"* ]]; then
           is_dangerous=true
           matched_cap="$dc"
           break
@@ -1172,6 +1195,7 @@ check_bash_history() {
 
   for hist_file in "${history_files[@]}"; do
     local file_hits=0
+    local hist_basename="${hist_file##*/}"  # basename inline, una vez por archivo
     mod_info "Revisando: $hist_file ($(wc -l < "$hist_file" 2>/dev/null || echo '?') líneas)"
 
     for pattern in "${pass_patterns[@]}"; do
@@ -1184,7 +1208,7 @@ check_bash_history() {
           local redacted
           redacted=$(echo "$match" | sed -E \
             's/([-=: ]+)([^[:space:]]{1,3})[^[:space:]]*/\1\2[REDACTED]/g')
-          mod_critical "Posible credencial en $(basename "$hist_file"): $redacted"
+          mod_critical "Posible credencial en $hist_basename: $redacted"
           file_hits=$((file_hits + 1))
           total_hits=$((total_hits + 1))
         done <<< "$matches"
@@ -1201,7 +1225,7 @@ check_bash_history() {
       hits=$(grep -icE "$cmd_pattern" "$hist_file" 2>/dev/null || echo "0")
       hits="${hits//[^0-9]/}"
       if [[ -n "$hits" && "$hits" -gt 0 ]]; then
-        mod_warning "Comando sensible (${hits}x) en $(basename "$hist_file"): $cmd_pattern"
+        mod_warning "Comando sensible (${hits}x) en $hist_basename: $cmd_pattern"
         file_hits=$((file_hits + hits))
         total_hits=$((total_hits + hits))
       fi
@@ -1254,11 +1278,12 @@ check_services() {
     fi
   fi
 
-  if id -nG | grep -q "\bdocker\b"; then
+  # Membresía en grupo docker — equivalente a root en el host
+  if [[ " $CURRENT_GROUPS " == *" docker "* ]]; then
     mod_critical "Usuario en grupo 'docker' — escalada a root posible"
     add_finding "user_in_docker_group" "critical" \
       "Usuario en grupo 'docker' — escalada a root posible" \
-      "user=$(whoami)" "group=docker"
+      "user=$CURRENT_USER" "group=docker"
   fi
 
   flush_module_json "Servicios"
@@ -1428,11 +1453,11 @@ check_containers() {
   done
 
   # ── Docker en el grupo del usuario ────────────────────────────────────────
-  if id -nG 2>/dev/null | grep -qw "docker"; then
+  if [[ " $CURRENT_GROUPS " == *" docker "* ]]; then
     mod_critical "Usuario en grupo 'docker' — equivalente a root en el host"
     add_finding "user_in_docker_group" "critical" \
       "Usuario en grupo 'docker' — equivalente a root en el host" \
-      "user=$(whoami)" "group=docker"
+      "user=$CURRENT_USER" "group=docker"
   fi
 
   # ── Montajes peligrosos desde el host ─────────────────────────────────────
@@ -1847,9 +1872,12 @@ check_pam_and_ssh_keys() {
           mod_warning "Permisos inusuales en $ak_file: $ak_perms (esperado: 600)"
         fi
 
-        # Archivo escribible por otros
-        [[ -w "$ak_file" ]] && ! [[ "$(stat -c '%U' "$ak_file")" == "$(whoami)" ]] && \
-          mod_critical "$ak_file es ESCRIBIBLE — inyección de clave SSH posible"
+        # Archivo escribible por otros (cacheado: evita fork de whoami por archivo)
+        if [[ -w "$ak_file" ]]; then
+          local ak_owner; ak_owner=$(stat -c '%U' "$ak_file" 2>/dev/null || echo "?")
+          [[ "$ak_owner" != "$CURRENT_USER" ]] && \
+            mod_critical "$ak_file es ESCRIBIBLE — inyección de clave SSH posible"
+        fi
       done
 
       # Permisos del directorio .ssh
@@ -1932,8 +1960,10 @@ check_processes() {
   print_header "17. PROCESOS, SOCKETS UNIX Y CONFIGS DE SHELL"
   _MOD_FINDINGS=(); _MOD_WARNINGS=(); _MOD_INFOS=()
 
-  local current_user; current_user=$(whoami)
-  local current_uid; current_uid=$(id -u)
+  # Aliases locales hacia el caché global — evita 2 forks (whoami + id -u)
+  # y mantiene el resto del módulo legible con nombres en lowercase.
+  local current_user="$CURRENT_USER"
+  local current_uid="$CURRENT_UID"
 
   # ── Procesos corriendo como root ──────────────────────────────────────────
   mod_info "Enumerando procesos como root..."
@@ -2037,10 +2067,23 @@ check_processes() {
 
   for proc_dir in /proc/[0-9]*; do
     [[ -d "$proc_dir" ]] || continue
-    local pid; pid=$(basename "$proc_dir")
+    local pid; pid="${proc_dir##*/}"
+    # Skip kernel threads en seco: no tienen /proc/<pid>/exe
+    [[ -L "$proc_dir/exe" ]] || continue
+
+    # Obtener UID del proceso desde /proc/<pid>/status (no fork de stat).
+    # Línea: "Uid:\t<real>\t<eff>\t<saved>\t<fs>"  — nos basta con el real.
+    local proc_uid="?"
+    if [[ -r "$proc_dir/status" ]]; then
+      while IFS= read -r sline; do
+        if [[ "$sline" == Uid:* ]]; then
+          # Tras 'Uid:' hay tabs y luego dígitos; nos quedamos con el primer entero
+          proc_uid="${sline#Uid:*[$'\t ']}"; proc_uid="${proc_uid%%[$'\t ']*}"
+          break
+        fi
+      done < "$proc_dir/status"
+    fi
     # Evitar procesos del propio usuario (lo que vemos con env ya está cubierto)
-    local proc_uid
-    proc_uid=$(stat -c '%u' "$proc_dir" 2>/dev/null || echo "?")
     [[ "$proc_uid" == "$current_uid" ]] && continue
 
     # /proc/<pid>/environ — separado por NUL
@@ -2066,7 +2109,7 @@ check_processes() {
       cmdline=$(tr '\0' ' ' < "$proc_dir/cmdline" 2>/dev/null | head -c 500 || echo "")
       [[ -z "$cmdline" ]] && continue
 
-      if echo "$cmdline" | grep -qiE "$cmd_secret_pattern" 2>/dev/null; then
+      if [[ "$cmdline" =~ $cmd_secret_pattern ]]; then
         local cmd_owner; cmd_owner=$(stat -c '%U' "$proc_dir/cmdline" 2>/dev/null || echo "?")
         # Redactar el match preservando solo primeros 3 chars del valor
         local redacted
@@ -2245,7 +2288,7 @@ export_json() {
 {
   "report": {
     "tool": "roothunter.sh",
-    "version": "1.2.1",
+    "version": "1.2.2",
     "schema_version": "2",
     "timestamp": "$TIMESTAMP_ISO",
     "script_sha256": "$SCRIPT_SHA256",
@@ -2253,9 +2296,9 @@ export_json() {
       "hostname": "$(json_escape "$(hostname 2>/dev/null || echo '?')")",
       "kernel": "$(json_escape "$(uname -r)")",
       "os": "$(json_escape "$(grep -oP '(?<=^PRETTY_NAME=").+(?=")' /etc/os-release 2>/dev/null || uname -s)")",
-      "user": "$(whoami)",
-      "uid": $(id -u),
-      "groups": "$(json_escape "$(id -Gn)")"
+      "user": "$CURRENT_USER",
+      "uid": $CURRENT_UID,
+      "groups": "$(json_escape "$CURRENT_GROUPS")"
     },
     "summary": {
       "critical": ${#FINDINGS[@]},
@@ -2295,7 +2338,7 @@ main() {
   echo "  ██║  ██║╚██████╔╝╚██████╔╝   ██║   ██║  ██║╚██████╔╝██║ ╚████║   ██║   ███████╗██║  ██║"
   echo "  ╚═╝  ╚═╝ ╚═════╝  ╚═════╝    ╚═╝   ╚═╝  ╚═╝ ╚═════╝ ╚═╝  ╚═══╝   ╚═╝   ╚══════╝╚═╝  ╚═╝"
   echo -e "${RESET}"
-  echo -e "${BOLD}  Script de Auditoría de Seguridad Linux v1.2.1${RESET}"
+  echo -e "${BOLD}  Script de Auditoría de Seguridad Linux v1.2.2${RESET}"
   echo -e "  ${YELLOW}⚠  Usar solo en sistemas con autorización explícita${RESET}"
   [[ -n "$SELECTED_MODULES" ]] && \
     echo -e "  ${CYAN}Módulos seleccionados: $SELECTED_MODULES${RESET}"
