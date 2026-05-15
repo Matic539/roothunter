@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # =============================================================================
-#  rh-analyze — Analizador de reportes RootHunter v1.2.1
+#  rh-analyze — Analizador de reportes RootHunter v1.2.2
 #  Lee reportes JSON generados por roothunter.sh
 #  análisis: sugerencias de exploits, attack paths, scoring, diff.
 #
@@ -565,6 +565,67 @@ def _check_cve_2021_22555(r: Report) -> bool:
         return False
     in_range = vge(k, '2.6.19') and vlt(k, '5.12.13')
     return in_range
+
+
+@exploit(
+    cve='CVE-2026-31431',
+    name='Copy Fail (algif_aead page-cache write)',
+    severity='critical',
+    description='Logic bug en algif_aead (AF_ALG) — escritura de 4 bytes en page cache → root',
+    poc_url='https://copy.fail/',
+    requires='kernel >= 4.14 (afecta kernels desde 2017), módulo algif_aead cargable',
+    confidence='medium',
+    confidence_note='muchas distros backportearon el fix sin bumpear el kernel.X.Y.Z; '
+                    'mitigable bloqueando el módulo algif_aead',
+)
+def _check_cve_2026_31431(r: Report) -> bool:
+    k = _get_kernel_version(r)
+    if not k:
+        return False
+    # Bug introducido ~2017 (kernel 4.14). Asumimos vulnerable salvo distros
+    # con fix backporteado. La nota de confianza ya advierte de falsos positivos.
+    return vge(k, '4.14')
+
+
+@exploit(
+    cve='CVE-2026-43284',
+    name='Dirty Frag (xfrm-ESP page-cache write)',
+    severity='critical',
+    description='Decryption in-place sobre buffers paged en esp4/esp6 — write primitive '
+                'en page cache; encadenable con CVE-2026-43500 (RxRPC) para root',
+    poc_url='https://github.com/V4bel/dirtyfrag',
+    requires='kernel >= 4.14, módulos esp4/esp6 cargables (IPsec)',
+    confidence='medium',
+    confidence_note='backports distroside frecuentes; PoC público; mitigable bloqueando '
+                    'esp4/esp6 o deshabilitando unprivileged user namespaces',
+)
+def _check_cve_2026_43284(r: Report) -> bool:
+    k = _get_kernel_version(r)
+    if not k:
+        return False
+    # xfrm-ESP page-cache write upstream desde ~2017 (kernel 4.14).
+    return vge(k, '4.14')
+
+
+@exploit(
+    cve='CVE-2026-43500',
+    name='Dirty Frag (RxRPC page-cache write)',
+    severity='critical',
+    description='Decryption in-place sobre buffers paged en rxrpc — write primitive '
+                'en page cache; mitad RxRPC de la cadena Dirty Frag (con CVE-2026-43284)',
+    poc_url='https://github.com/V4bel/dirtyfrag',
+    requires='kernel >= 6.0 (RxRPC bug introducido ~2023), módulo rxrpc cargable',
+    confidence='medium',
+    confidence_note='más reciente que la mitad ESP; en RHEL 8 / kernels <6.0 puede no aplicar. '
+                    'Mitigable bloqueando el módulo rxrpc',
+)
+def _check_cve_2026_43500(r: Report) -> bool:
+    k = _get_kernel_version(r)
+    if not k:
+        return False
+    # RxRPC page-cache write introducido ~2023; afecta kernels 6.x en adelante
+    # hasta los fixes upstream de mayo 2026.
+    return vge(k, '6.0')
 
 
 @exploit(
