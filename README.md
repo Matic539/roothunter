@@ -2,12 +2,12 @@
 
 > Suite de auditoría ofensiva para Linux: recolección de evidencia + análisis de vectores de escalada de privilegios con priorización tipo pentester.
 
-![Bash](https://img.shields.io/badge/bash-5.x-green?logo=gnubash&logoColor=white)
+![Bash](https://img.shields.io/badge/bash-4%2B-green?logo=gnubash&logoColor=white)
 ![Python](https://img.shields.io/badge/python-3.7+-blue?logo=python&logoColor=white)
 ![Platform](https://img.shields.io/badge/platform-Linux-blue)
 ![License](https://img.shields.io/badge/license-MIT-lightgrey)
-![roothunter](https://img.shields.io/badge/roothunter.sh-1.2.0-orange)
-![rh-analyze](https://img.shields.io/badge/rh--analyze-1.2-orange)
+![roothunter](https://img.shields.io/badge/roothunter.sh-1.2.4-orange)
+![rh-analyze](https://img.shields.io/badge/rh--analyze-1.2.2-orange)
 
 ---
 
@@ -201,6 +201,9 @@ El JSON resultante incluye `verified=true|false|unknown` por finding. `rh-analyz
 | CVE-2023-32233 | Netfilter nf_tables UAF | crítica | medium |
 | CVE-2022-2588 | cls_route UAF | alta | medium |
 | CVE-2021-22555 | Netfilter heap overflow | alta | medium |
+| CVE-2026-31431 | Copy Fail (algif_aead page-cache write) | crítica | medium |
+| CVE-2026-43284 | Dirty Frag (xfrm-ESP page-cache write) | crítica | medium |
+| CVE-2026-43500 | Dirty Frag (RxRPC page-cache write) | crítica | medium |
 | CVE-2025-6019 | libblockdev/udisks LPE | alta | low |
 | GTFOBins | Grupo `docker` = root en host | crítica | high |
 | Container escape | Docker socket escribible | crítica | high |
@@ -248,19 +251,19 @@ El JSON resultante incluye `verified=true|false|unknown` por finding. `rh-analyz
 ## 🔄 Flujo de trabajo recomendado
 
 ```bash
-# Día 1: auditoría inicial con verificación de vectores
+# 1: auditoría inicial con verificación de vectores
 bash roothunter.sh -V -j /tmp/host01.json
 
-# Día 1: análisis con comandos priorizados por tier
+# 2: análisis con comandos priorizados por tier
 ./rh-analyze /tmp/host01.json --commands
 
-# Día 1: confirmar las técnicas tier 1 con dry-runs no destructivos
+# confirmar las técnicas tier 1 con dry-runs no destructivos
 ./rh-analyze /tmp/host01.json --confirm
 
-# Día 1: revisar prioridades en flota completa
+# revisar prioridades en flota completa
 ./rh-analyze --batch /var/audits/*.json
 
-# Día 7: tras aplicar parches, comparar
+# tras aplicar parches, comparar
 bash roothunter.sh -V -j /tmp/host01_v2.json
 ./rh-analyze --diff /tmp/host01.json /tmp/host01_v2.json
 
@@ -293,7 +296,7 @@ El reporte JSON incluye metadata del host, SHA256 del script, summary, findings 
 {
   "report": {
     "tool": "roothunter.sh",
-    "version": "1.2.0",
+    "version": "1.2.4",
     "schema_version": "2",
     "timestamp": "2025-01-01T00:00:00Z",
     "script_sha256": "abc123...",
