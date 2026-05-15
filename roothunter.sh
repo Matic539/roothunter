@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # =============================================================================
-#  roothunter.sh — Script de Auditoría de Seguridad Linux v1.2.3
+#  roothunter.sh — Script de Auditoría de Seguridad Linux v1.2.4
 #  Detecta vectores comunes de escalada de privilegios
 #  Autor: Matias López | Portafolio: github.com/Matic539
 #
@@ -574,27 +574,56 @@ check_suid_sgid() {
 
 # ─── 3. Sudo ──────────────────────────────────────────────────────────────────
 # Helper: parsea una línea de sudo -l y emite un finding por cada binario.
-# Formato típico: "    (ALL : ALL) NOPASSWD: /usr/bin/find, /usr/bin/vim"
-# o también:      "    (root) /usr/bin/less *"
+# Formato sudoers soportado:
+#   (ALL : ALL) NOPASSWD: /usr/bin/find, /usr/bin/vim
+#   (ALL : ALL) ALL                              ← cualquier comando
+#   (root) NOPASSWD: ALL                         ← cualquier comando como root
+#   (root) /usr/bin/less *                       ← comando con args/wildcard
+#
+# IMPORTANTE: La palabra literal 'ALL' como comando significa "cualquier
+# comando" en sintaxis sudoers — es escalada total inmediata vía `sudo bash`.
 _parse_sudo_line() {
   local line="$1" source="$2"
-  # Extraer el RunAs (entre paréntesis) — opcional pero útil
-  local runas=""
-  if [[ "$line" =~ \(([^\)]+)\) ]]; then
-    runas="${BASH_REMATCH[1]}"
-  fi
-  # Detectar NOPASSWD
-  local nopasswd="false"
-  echo "$line" | grep -qi "NOPASSWD" && nopasswd="true"
+  local nopasswd_hint="${3:-false}"  # "true" si el caller ya sabe que es NOPASSWD
 
-  # La parte después del último ':' o '))' contiene los comandos
-  local cmds_part="$line"
-  if [[ "$line" == *":"* ]]; then
-    cmds_part="${line##*:}"
-  elif [[ "$line" == *")"* ]]; then
-    cmds_part="${line##*)}"
+  # Strip leading whitespace para regex limpio
+  local trimmed="${line#"${line%%[![:space:]]*}"}"
+
+  # Regex única: (runas) [NOPASSWD:] comandos
+  # Captura: 1=runas, 2=NOPASSWD opcional, 3=parte de comandos
+  local runas="" nopasswd="false" cmds_part=""
+  if [[ "$trimmed" =~ ^\(([^\)]+)\)[[:space:]]*(NOPASSWD:[[:space:]]*)?(.*)$ ]]; then
+    runas="${BASH_REMATCH[1]}"
+    [[ -n "${BASH_REMATCH[2]}" ]] && nopasswd="true"
+    cmds_part="${BASH_REMATCH[3]}"
+  else
+    # Línea de sudoers sin runas explícito (ej: "user ALL=(ALL) NOPASSWD: ALL")
+    # Fallback: solo detectar NOPASSWD y usar todo lo que sigue al último ':'
+    [[ "$trimmed" =~ NOPASSWD ]] && nopasswd="true"
+    if [[ "$trimmed" == *":"* ]]; then
+      cmds_part="${trimmed##*:}"
+    else
+      cmds_part="$trimmed"
+    fi
   fi
-  cmds_part="${cmds_part#"${cmds_part%%[![:space:]]*}"}"  # ltrim
+
+  [[ "$nopasswd_hint" == "true" ]] && nopasswd="true"
+  # ltrim cmds_part
+  cmds_part="${cmds_part#"${cmds_part%%[![:space:]]*}"}"
+
+  if [[ "$cmds_part" == "ALL" ]] || [[ "$cmds_part" =~ ^ALL[[:space:]]*$ ]] \
+     || [[ "$cmds_part" =~ ^ALL[[:space:]]*, ]] || [[ "$cmds_part" =~ ,[[:space:]]*ALL[[:space:]]*$ ]] \
+     || [[ "$cmds_part" =~ ,[[:space:]]*ALL[[:space:]]*, ]]; then
+    local sev="critical"
+    local msg="Sudo: usuario puede ejecutar CUALQUIER comando"
+    [[ "$nopasswd" == "true" ]] && msg+=" SIN contraseña (NOPASSWD)"
+    msg+=" como '$runas'. Escalada: sudo /bin/bash"
+    add_finding "sudo_all_commands" "$sev" "$msg" \
+      "runas=$runas" "nopasswd=$nopasswd" "source=$source" \
+      "exploit=sudo /bin/bash" "exploit_alt=sudo -i"
+    # NO retornamos: si hay más comandos en la lista, los seguimos parseando
+    # como findings individuales (defensivo, raramente ocurre con ALL).
+  fi
 
   # Split por coma — cada item es un comando permitido
   local IFS_OLD="$IFS"; IFS=','
@@ -606,6 +635,8 @@ _parse_sudo_line() {
     cmd_full="${cmd_full#"${cmd_full%%[![:space:]]*}"}"
     cmd_full="${cmd_full%"${cmd_full##*[![:space:]]}"}"
     [[ -z "$cmd_full" ]] && continue
+    # Si el token es literalmente 'ALL' ya lo emitimos arriba; saltar.
+    [[ "$cmd_full" == "ALL" ]] && continue
 
     # Extraer path del binario (primera "palabra" del comando)
     local bin_path bin_name args has_wildcard="false"
@@ -663,30 +694,71 @@ check_sudo() {
     while IFS= read -r line; do
       [[ -z "$line" || "$line" =~ ^(Matching|User|Defaults) ]] && continue
       mod_critical "  → $line"
-      _parse_sudo_line "$line" "sudo -l"
+      _parse_sudo_line "$line" "sudo -l" "true"
     done < <(sudo -n -l 2>/dev/null || true)
   else
     mod_info "sudo requiere contraseña o no hay permisos configurados"
   fi
 
-  # Grupo privilegiado — usar el caché en vez de id -nG | tr | grep | tr | sed
-  local priv_groups=""
+  # Grupos privilegiados — distinguimos dos clases:
+  #   sudo-equivalents:  permiten ejecutar sudo (warning, ya cubierto arriba)
+  #   root-equivalents:  ESCALADA DIRECTA A ROOT sin sudo (critical)
+  #
+  # Los root-equivalents son grupos donde la membresía sola permite
+  # comprometer el sistema, sin necesidad de password ni sudo:
+  #   lxd/lxc      → crear container privilegiado montando / del host
+  #   docker       → docker run -v /:/host alpine chroot /host
+  #   disk         → leer/escribir devices del filesystem directamente
+  #   shadow       → leer /etc/shadow (offline cracking)
+  #   adm          → leer /var/log (puede contener secretos)
+  #   video/kvm    → acceso a hardware sensible (menos directo)
+  local sudo_groups="" root_groups=""
   for g in $CURRENT_GROUPS; do
     case "$g" in
-      sudo|wheel|admin) priv_groups+="${priv_groups:+ }$g" ;;
+      sudo|wheel|admin)
+        sudo_groups+="${sudo_groups:+ }$g" ;;
+      lxd|lxc|docker|disk|shadow|adm)
+        root_groups+="${root_groups:+ }$g" ;;
     esac
   done
-  if [[ -n "$priv_groups" ]]; then
-    mod_warning "Grupo privilegiado: $priv_groups"
+
+  if [[ -n "$sudo_groups" ]]; then
+    mod_warning "Grupo privilegiado: $sudo_groups"
     add_finding "privileged_group_membership" "warning" \
-      "Usuario en grupo privilegiado: $priv_groups" \
-      "groups=$priv_groups"
+      "Usuario en grupo privilegiado: $sudo_groups" \
+      "groups=$sudo_groups"
   fi
 
+  for g in $root_groups; do
+    local exploit="" desc=""
+    case "$g" in
+      lxd|lxc)
+        desc="Crear container privilegiado montando / del host"
+        exploit="lxc init alpine c -c security.privileged=true; lxc config device add c disk source=/ path=/mnt recursive=true; lxc start c; lxc exec c sh" ;;
+      docker)
+        desc="Lanzar container con / del host montado"
+        exploit="docker run -v /:/host --rm -it alpine chroot /host" ;;
+      disk)
+        desc="Acceso raw a devices — leer /etc/shadow o reescribir binarios"
+        exploit="debugfs /dev/sda1  # o: dd if=/dev/sda | strings" ;;
+      shadow)
+        desc="Lectura de /etc/shadow — crackear hashes offline"
+        exploit="cat /etc/shadow > /tmp/sh.txt; john /tmp/sh.txt" ;;
+      adm)
+        desc="Lectura de /var/log — puede contener secretos, sesiones, tokens"
+        exploit="grep -riE 'password|token|secret' /var/log/ 2>/dev/null" ;;
+    esac
+    mod_critical "Grupo ROOT-EQUIVALENTE: $g — $desc"
+    add_finding "root_equivalent_group" "critical" \
+      "Usuario en grupo '$g' — escalada directa a root: $desc" \
+      "group=$g" "user=$CURRENT_USER" "exploit=$exploit"
+  done
+
   if [[ -r /etc/sudoers ]]; then
+    # Las líneas que grep'eamos contienen "NOPASSWD" por construcción → hint=true
     while IFS= read -r line; do
       mod_critical "NOPASSWD en /etc/sudoers: $line"
-      _parse_sudo_line "$line" "/etc/sudoers"
+      _parse_sudo_line "$line" "/etc/sudoers" "true"
     done < <(grep -i "NOPASSWD" /etc/sudoers 2>/dev/null | grep -v "^#" || true)
   fi
 
@@ -695,7 +767,7 @@ check_sudo() {
       [[ -r "$f" ]] || continue
       while IFS= read -r line; do
         mod_critical "NOPASSWD en $f: $line"
-        _parse_sudo_line "$line" "$f"
+        _parse_sudo_line "$line" "$f" "true"
       done < <(grep -i "NOPASSWD" "$f" 2>/dev/null | grep -v "^#" || true)
     done
   fi
@@ -704,13 +776,80 @@ check_sudo() {
 }
 
 # ─── 4. Cron jobs ─────────────────────────────────────────────────────────────
+# Helper: dado un path a un script, chequea recursivamente si es escribible
+# o si referencia otros scripts/binarios escribibles (1 nivel de profundidad).
+# Emite findings críticos por cada vector encontrado.
+#
+# Argumentos:
+#   $1 = path al script referenciado
+#   $2 = path al cron file que lo referencia (para attribution)
+#   $3 = max_depth (default 1)
+_cron_check_script() {
+  local script="$1" cron_source="$2" depth="${3:-1}"
+  [[ -f "$script" ]] || return 0
+
+  local script_owner; script_owner=$(stat -c '%U' "$script" 2>/dev/null || echo '?')
+  local cron_owner;   cron_owner=$(stat -c '%U' "$cron_source" 2>/dev/null || echo '?')
+
+  # ─ Vector 1: el script en sí es escribible ────────────────────────────────
+  if [[ -w "$script" ]]; then
+    mod_critical "Script cron ESCRIBIBLE: $script (referenciado en $cron_source)"
+    add_finding "cron_writable_script" "critical" \
+      "Script cron ESCRIBIBLE: $script (referenciado en $cron_source)" \
+      "script=$script" "cron_source=$cron_source" \
+      "cron_owner=$cron_owner" "script_owner=$script_owner" \
+      "depth=0"
+    return 0  # ya es game over, no profundizamos
+  fi
+
+  # ─ Vector 2: directorio del script escribible (swap del archivo entero) ───
+  local script_dir; script_dir=$(dirname "$script" 2>/dev/null || echo "")
+  if [[ -n "$script_dir" && -w "$script_dir" ]]; then
+    mod_critical "Directorio del script cron ESCRIBIBLE: $script_dir (script: $script)"
+    add_finding "cron_writable_script_dir" "critical" \
+      "Directorio del script cron ESCRIBIBLE: $script_dir (script: $script)" \
+      "directory=$script_dir" "script=$script" "cron_source=$cron_source"
+  fi
+
+  # ─ Vector 3 (transitivo): el script referencia OTROS paths escribibles ────
+  # Solo si el script es legible y aún tenemos profundidad
+  [[ $depth -le 0 || ! -r "$script" ]] && return 0
+  while IFS= read -r referenced; do
+    # Solo paths absolutos a archivos existentes
+    [[ -z "$referenced" || "$referenced" != /* || ! -e "$referenced" ]] && continue
+    # Evitar bucles obvios
+    [[ "$referenced" == "$script" ]] && continue
+    if [[ -w "$referenced" ]]; then
+      mod_critical "Script cron referencia path ESCRIBIBLE: $referenced (cadena: $cron_source → $script → $referenced)"
+      add_finding "cron_writable_transitive" "critical" \
+        "Script cron referencia path ESCRIBIBLE: $referenced (cadena: $cron_source → $script → $referenced)" \
+        "writable_path=$referenced" "script=$script" "cron_source=$cron_source" \
+        "depth=1"
+    fi
+  done < <(grep -oE '(/[A-Za-z0-9_./-]+)' "$script" 2>/dev/null \
+           | sort -u | head -50 || true)
+}
+
+# Helper: chequea una línea de crontab por wildcards en argumentos
+_cron_check_wildcard() {
+  local line="$1" cron_source="$2"
+  local wildcard_re='(tar|rsync|chown|chmod|7z|zip|find|scp|wget|cp|mv|cat)[[:space:]]+[^|]*[*?]'
+  if [[ "$line" =~ $wildcard_re ]]; then
+    mod_warning "Cron con wildcard en comando sensible: $line"
+    add_finding "cron_wildcard_injection_candidate" "warning" \
+      "Cron usa wildcard con comando sensible (posible wildcard injection): $line" \
+      "cron_source=$cron_source" "line=${line:0:160}" \
+      "hint=verificar cwd del comando — si es escribible, hay escalada"
+  fi
+}
+
 check_cron() {
   print_header "4. TAREAS CRON"
   _MOD_FINDINGS=(); _MOD_WARNINGS=(); _MOD_INFOS=()
 
   local cron_paths=(
     /etc/crontab /etc/cron.d /etc/cron.daily
-    /etc/cron.weekly /etc/cron.monthly
+    /etc/cron.weekly /etc/cron.monthly /etc/cron.hourly
     /var/spool/cron /var/spool/cron/crontabs
   )
 
@@ -718,43 +857,119 @@ check_cron() {
     if [[ -f "$path" ]]; then
       local cron_owner; cron_owner=$(stat -c '%U' "$path" 2>/dev/null || echo '?')
       mod_info "Cron: $path (owner: $cron_owner)"
-      while IFS= read -r script; do
-        if [[ -f "$script" && -w "$script" ]]; then
-          mod_critical "Script cron ESCRIBIBLE: $script"
-          local script_owner; script_owner=$(stat -c '%U' "$script" 2>/dev/null || echo '?')
-          add_finding "cron_writable_script" "critical" \
-            "Script cron ESCRIBIBLE: $script (referenciado en $path)" \
-            "script=$script" "cron_source=$path" \
-            "cron_owner=$cron_owner" "script_owner=$script_owner"
-        fi
-      done < <(grep -oP '(/[^\s]+)' "$path" 2>/dev/null || true)
+      add_finding "cron_file" "info" "Cron file: $path" \
+        "path=$path" "owner=$cron_owner" "type=file"
+
+      # ¿El crontab en sí es escribible? Vector directo a root.
+      if [[ -w "$path" ]]; then
+        mod_critical "Crontab ESCRIBIBLE: $path — agregar línea = ejecución como $cron_owner"
+        add_finding "cron_file_writable" "critical" \
+          "Crontab ESCRIBIBLE: $path — agregar línea = ejecución como $cron_owner" \
+          "path=$path" "owner=$cron_owner"
+      fi
+
+      # PATH inyectable: si el crontab define PATH= con un dir escribible primero,
+      # cualquier comando bare (no path absoluto) será hijacked.
+      while IFS= read -r path_line; do
+        local cron_path="${path_line#*=}"
+        cron_path="${cron_path//\"/}"; cron_path="${cron_path//\'/}"
+        local IFS_OLD="$IFS"; IFS=':'
+        local dirs=($cron_path)
+        IFS="$IFS_OLD"
+        for d in "${dirs[@]}"; do
+          [[ -z "$d" ]] && continue
+          if [[ -d "$d" && -w "$d" ]]; then
+            mod_critical "PATH de cron incluye directorio ESCRIBIBLE: $d (en $path)"
+            add_finding "cron_path_writable" "critical" \
+              "PATH de cron incluye directorio ESCRIBIBLE: $d (en $path)" \
+              "directory=$d" "cron_source=$path" "cron_path=$cron_path"
+          fi
+        done
+      done < <(grep -E '^[[:space:]]*PATH[[:space:]]*=' "$path" 2>/dev/null || true)
+
+      # Por cada línea de cron, chequear scripts referenciados y wildcards
+      while IFS= read -r line; do
+        [[ -z "$line" || "$line" =~ ^[[:space:]]*# ]] && continue
+        # Líneas de definición (PATH=, MAILTO=, SHELL=) no son comandos
+        [[ "$line" =~ ^[[:space:]]*[A-Z_]+= ]] && continue
+        _cron_check_wildcard "$line" "$path"
+        # Extraer paths absolutos referenciados
+        while IFS= read -r script; do
+          _cron_check_script "$script" "$path" 1
+        done < <(grep -oE '(/[A-Za-z0-9_./-]+)' <<< "$line" 2>/dev/null | sort -u || true)
+      done < "$path"
 
     elif [[ -d "$path" ]]; then
       for f in "$path"/*; do
         [[ -f "$f" ]] || continue
         local cron_owner; cron_owner=$(stat -c '%U' "$f" 2>/dev/null || echo '?')
         mod_info "Cron job: $f (owner: $cron_owner)"
-        while IFS= read -r script; do
-          if [[ -f "$script" && -w "$script" ]]; then
-            mod_critical "Script cron ESCRIBIBLE: $script (en $f)"
-            local script_owner; script_owner=$(stat -c '%U' "$script" 2>/dev/null || echo '?')
-            add_finding "cron_writable_script" "critical" \
-              "Script cron ESCRIBIBLE: $script (en $f)" \
-              "script=$script" "cron_source=$f" \
-              "cron_owner=$cron_owner" "script_owner=$script_owner"
-          fi
-        done < <(grep -oP '(/[^\s]+)' "$f" 2>/dev/null || true)
+        add_finding "cron_file" "info" "Cron job: $f" \
+          "path=$f" "owner=$cron_owner" "type=dir_entry"
+
+        if [[ -w "$f" ]]; then
+          mod_critical "Cron job ESCRIBIBLE: $f — ejecución como $cron_owner garantizada"
+          add_finding "cron_file_writable" "critical" \
+            "Cron job ESCRIBIBLE: $f — ejecución como $cron_owner garantizada" \
+            "path=$f" "owner=$cron_owner"
+        fi
+
+        # Aplicar mismos checks que arriba: PATH= inyectable, wildcards, scripts
+        while IFS= read -r path_line; do
+          local cron_path="${path_line#*=}"
+          cron_path="${cron_path//\"/}"; cron_path="${cron_path//\'/}"
+          local IFS_OLD="$IFS"; IFS=':'
+          local dirs=($cron_path)
+          IFS="$IFS_OLD"
+          for d in "${dirs[@]}"; do
+            [[ -z "$d" ]] && continue
+            if [[ -d "$d" && -w "$d" ]]; then
+              mod_critical "PATH de cron incluye directorio ESCRIBIBLE: $d (en $f)"
+              add_finding "cron_path_writable" "critical" \
+                "PATH de cron incluye directorio ESCRIBIBLE: $d (en $f)" \
+                "directory=$d" "cron_source=$f" "cron_path=$cron_path"
+            fi
+          done
+        done < <(grep -E '^[[:space:]]*PATH[[:space:]]*=' "$f" 2>/dev/null || true)
+
+        while IFS= read -r line; do
+          [[ -z "$line" || "$line" =~ ^[[:space:]]*# ]] && continue
+          [[ "$line" =~ ^[[:space:]]*[A-Z_]+= ]] && continue
+          _cron_check_wildcard "$line" "$f"
+          while IFS= read -r script; do
+            _cron_check_script "$script" "$f" 1
+          done < <(grep -oE '(/[A-Za-z0-9_./-]+)' <<< "$line" 2>/dev/null | sort -u || true)
+        done < "$f"
       done
     fi
   done
 
+  # Crontab del usuario actual
   local crontab_out
   crontab_out=$(crontab -l 2>/dev/null || true)
   if [[ -n "$crontab_out" ]]; then
     while IFS= read -r line; do
       [[ -n "$line" && ! "$line" =~ ^# ]] && mod_info "Crontab usuario: $line"
     done <<< "$crontab_out"
+    add_finding "user_crontab_exists" "info" \
+      "Crontab del usuario actual definido" \
+      "user=$CURRENT_USER" "line_count=$(echo "$crontab_out" | grep -cvE '^#|^$')"
   fi
+
+  # Crontabs de OTROS usuarios accesibles — en CTFs es común dejar
+  # /var/spool/cron/crontabs/<user> con permisos relajados.
+  for spool in /var/spool/cron/crontabs /var/spool/cron; do
+    [[ -d "$spool" ]] || continue
+    for f in "$spool"/*; do
+      [[ -f "$f" && -r "$f" ]] || continue
+      local ct_owner; ct_owner=$(stat -c '%U' "$f" 2>/dev/null || echo '?')
+      [[ "$ct_owner" == "$CURRENT_USER" ]] && continue
+      mod_warning "Crontab de otro usuario LEGIBLE: $f (owner=$ct_owner)"
+      add_finding "other_user_crontab_readable" "warning" \
+        "Crontab de otro usuario LEGIBLE: $f (owner=$ct_owner) — posible info leak" \
+        "path=$f" "owner=$ct_owner"
+    done
+  done
 
   flush_module_json "Cron"
 }
@@ -1628,12 +1843,12 @@ check_cloud_imds() {
   mod_info "Buscando credenciales cloud en archivos locales..."
   local home_dir="${HOME:-/root}"
   local cloud_files=(
-    "$home_dir/.aws/credentials"
-    "$home_dir/.aws/config"
-    "$home_dir/.config/gcloud/credentials.db"
-    "$home_dir/.config/gcloud/application_default_credentials.json"
-    "$home_dir/.azure/azureProfile.json"
-    "$home_dir/.azure/accessTokens.json"
+    "$HOME/.aws/credentials"
+    "$HOME/.aws/config"
+    "$HOME/.config/gcloud/credentials.db"
+    "$HOME/.config/gcloud/application_default_credentials.json"
+    "$HOME/.azure/azureProfile.json"
+    "$HOME/.azure/accessTokens.json"
     /etc/boto.cfg
     /etc/s3cfg
   )
@@ -1666,7 +1881,7 @@ check_systemd() {
     /lib/systemd/system
     /usr/lib/systemd/system
     /run/systemd/system
-    "${HOME:-/root}/.config/systemd/user"
+    "$HOME/.config/systemd/user"
   )
 
   mod_info "Revisando units y timers de systemd..."
@@ -2289,7 +2504,7 @@ export_json() {
 {
   "report": {
     "tool": "roothunter.sh",
-    "version": "1.2.2",
+    "version": "1.2.4",
     "schema_version": "2",
     "timestamp": "$TIMESTAMP_ISO",
     "script_sha256": "$SCRIPT_SHA256",
@@ -2339,7 +2554,7 @@ main() {
   echo "  ██║  ██║╚██████╔╝╚██████╔╝   ██║   ██║  ██║╚██████╔╝██║ ╚████║   ██║   ███████╗██║  ██║"
   echo "  ╚═╝  ╚═╝ ╚═════╝  ╚═════╝    ╚═╝   ╚═╝  ╚═╝ ╚═════╝ ╚═╝  ╚═══╝   ╚═╝   ╚══════╝╚═╝  ╚═╝"
   echo -e "${RESET}"
-  echo -e "${BOLD}  Script de Auditoría de Seguridad Linux v1.2.3${RESET}"
+  echo -e "${BOLD}  Script de Auditoría de Seguridad Linux v1.2.4${RESET}"
   echo -e "  ${YELLOW}⚠  Usar solo en sistemas con autorización explícita${RESET}"
   [[ -n "$SELECTED_MODULES" ]] && \
     echo -e "  ${CYAN}Módulos seleccionados: $SELECTED_MODULES${RESET}"
