@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # =============================================================================
-#  roothunter.sh — Script de Auditoría de Seguridad Linux v1.2.2
+#  roothunter.sh — Script de Auditoría de Seguridad Linux v1.2.3
 #  Detecta vectores comunes de escalada de privilegios
 #  Autor: Matias López | Portafolio: github.com/Matic539
 #
@@ -1165,7 +1165,7 @@ check_bash_history() {
   )
 
   local history_files=()
-  local current_hist="${HISTFILE:-$HOME/.bash_history}"
+  local current_hist="${HISTFILE:-${HOME:-/root}/.bash_history}"
   [[ -f "$current_hist" ]] && history_files+=("$current_hist")
 
   for home_dir in /root /home/*; do
@@ -1626,13 +1626,14 @@ check_cloud_imds() {
 
   # ── Credenciales cloud en archivos locales ────────────────────────────────
   mod_info "Buscando credenciales cloud en archivos locales..."
+  local home_dir="${HOME:-/root}"
   local cloud_files=(
-    "$HOME/.aws/credentials"
-    "$HOME/.aws/config"
-    "$HOME/.config/gcloud/credentials.db"
-    "$HOME/.config/gcloud/application_default_credentials.json"
-    "$HOME/.azure/azureProfile.json"
-    "$HOME/.azure/accessTokens.json"
+    "$home_dir/.aws/credentials"
+    "$home_dir/.aws/config"
+    "$home_dir/.config/gcloud/credentials.db"
+    "$home_dir/.config/gcloud/application_default_credentials.json"
+    "$home_dir/.azure/azureProfile.json"
+    "$home_dir/.azure/accessTokens.json"
     /etc/boto.cfg
     /etc/s3cfg
   )
@@ -1665,7 +1666,7 @@ check_systemd() {
     /lib/systemd/system
     /usr/lib/systemd/system
     /run/systemd/system
-    "$HOME/.config/systemd/user"
+    "${HOME:-/root}/.config/systemd/user"
   )
 
   mod_info "Revisando units y timers de systemd..."
@@ -2338,7 +2339,7 @@ main() {
   echo "  ██║  ██║╚██████╔╝╚██████╔╝   ██║   ██║  ██║╚██████╔╝██║ ╚████║   ██║   ███████╗██║  ██║"
   echo "  ╚═╝  ╚═╝ ╚═════╝  ╚═════╝    ╚═╝   ╚═╝  ╚═╝ ╚═════╝ ╚═╝  ╚═══╝   ╚═╝   ╚══════╝╚═╝  ╚═╝"
   echo -e "${RESET}"
-  echo -e "${BOLD}  Script de Auditoría de Seguridad Linux v1.2.2${RESET}"
+  echo -e "${BOLD}  Script de Auditoría de Seguridad Linux v1.2.3${RESET}"
   echo -e "  ${YELLOW}⚠  Usar solo en sistemas con autorización explícita${RESET}"
   [[ -n "$SELECTED_MODULES" ]] && \
     echo -e "  ${CYAN}Módulos seleccionados: $SELECTED_MODULES${RESET}"
